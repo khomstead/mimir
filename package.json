@@ -1,0 +1,19 @@
+{
+  "name": "@speki/mimir",
+  "version": "0.2.0",
+  "description": "Mimir — Headless intelligence layer for the Speki ecosystem. Graph-backed knowledge substrate with 7 MCP verbs.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "test": "bun test",
+    "clean": "bun run scripts/clean-stale-data.ts"
+  },
+  "dependencies": {
+    "falkordblite": "^0.2.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^4.80.0",
+    "zod": "^3.24.0"
+  }
+}

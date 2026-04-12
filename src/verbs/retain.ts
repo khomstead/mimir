@@ -24,6 +24,7 @@ import {
 } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
 import { extractFromText } from "../extraction.js";
+import { evaluateTension } from "../tension-eval.js";
 import type {
   RetainResponse,
   EpisodeSourceType,
@@ -200,11 +201,25 @@ export async function retain(
         );
         if (anchorsResult.data) {
           for (const row of anchorsResult.data as Record<string, unknown>[]) {
-            tensions.push({
-              anchor_id: row.id as string,
-              anchor_content: row.content as string,
-              tension_description: `Potential tension with anchor in domain "${domain}" — full evaluation deferred to anchor verb`,
-            });
+            const anchorId = row.id as string;
+            const anchorContent = row.content as string;
+
+            // LLM-powered tension evaluation
+            const evaluation = await evaluateTension(anchorContent, content);
+
+            if (evaluation && (evaluation.alignment === "tensions" || evaluation.alignment === "contradicts")) {
+              tensions.push({
+                anchor_id: anchorId,
+                anchor_content: anchorContent,
+                tension_description: evaluation.tension_description,
+              });
+
+              // Create tensions_with edge in the graph
+              await createEdge("Thought", thoughtId, "Anchor", anchorId, "tensions_with", {
+                source_episode_id: episodeId,
+                confidence: evaluation.severity,
+              });
+            }
           }
         }
       } catch {

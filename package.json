@@ -10,9 +10,10 @@
     "clean": "bun run scripts/clean-stale-data.ts"
   },
   "dependencies": {
-    "falkordblite": "^0.2.0",
-    "@modelcontextprotocol/sdk": "^1.27.1",
     "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "convex": "^1.35.1",
+    "falkordblite": "^0.2.0",
     "openai": "^4.80.0",
     "zod": "^3.24.0"
   }

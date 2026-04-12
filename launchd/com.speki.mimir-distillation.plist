@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.speki.mimir-distillation</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/kyle/.bun/bin/bun</string>
+        <string>run</string>
+        <string>/Volumes/AI-Lab/Projects/mimir/scripts/nightly-distillation.ts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Volumes/AI-Lab/Projects/mimir</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/kyle/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>MIMIR_DATA_PATH</key>
+        <string>/Volumes/AI-Lab/falkordb-data/personal-brain</string>
+    </dict>
+
+    <!-- Run at 11 PM nightly (StartCalendarInterval fires after wake if missed) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Volumes/AI-Lab/logs/mimir-distillation.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Volumes/AI-Lab/logs/mimir-distillation.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

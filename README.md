@@ -53,10 +53,30 @@ Input (voice/chat/email/text)
 All edges are temporally tracked (valid_from, valid_until, confidence):
 `relates_to`, `constrains`, `extracted_from`, `evolves`, `supersedes`, `involves`, `contributes_to`, `tensions_with`, `authored_by`, `scoped_to`, `created_by`, `demonstrates`, `discussed_in`, `progresses_from`
 
+## The Gatekeeper Pattern
+
+Mimir runs as a **persistent service** that owns the FalkorDB lock. All clients connect via protocol — no one touches the database file directly.
+
+```
+┌─────────────────────────────────────────────┐
+│           Mimir Service (port 4200)         │
+│                                             │
+│   FalkorDB ←── single lock holder          │
+│   HTTP API ──→ GoBot, Observatory, scripts  │
+│   MCP stdio ─→ Claude Code (on demand)      │
+└─────────────────────────────────────────────┘
+        ↑              ↑              ↑
+    GoBot daemon   Observatory    Claude Code
+    (fetch HTTP)   (fetch HTTP)   (MCP tools)
+```
+
+Why not let each client open FalkorDB directly? **FalkorDBLite is an embedded database** — only one process can hold the write lock. If the MCP server holds it and GoBot also tries to open it, GoBot sees empty data. The gatekeeper pattern eliminates this: one process owns the data, everyone else talks HTTP.
+
 ## Setup
 
 ### Prerequisites
 - [Bun](https://bun.sh) runtime
+- `redis-server` (FalkorDBLite dependency): `brew install redis`
 - Anthropic API key (for entity extraction)
 - OpenAI API key (for embeddings)
 
@@ -69,13 +89,37 @@ cp .env.example .env
 # Edit .env with your API keys
 ```
 
-### Run standalone
+### Run as persistent service (recommended)
 ```bash
-bun run start
+# Start the HTTP service (port 4200)
+bun run src/service.ts
+
+# Or install as launchd service (starts at boot, restarts on crash)
+cp launchd/com.speki.mimir.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.speki.mimir.plist
+
+# Verify
+curl http://localhost:4200/health
 ```
 
-### Wire to Claude Code
-Add to your project's `.mcp.json`:
+### HTTP API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/health` | Health check |
+| GET | `/api/context?q=...` | Formatted text for prompt injection |
+| GET | `/api/recall?q=...` | Full recall with all strategies |
+| GET | `/api/pulse?entity=...` | Status synthesis |
+| GET | `/api/reflect` | Distillation |
+| GET | `/api/entities` | Entity list (text) |
+| POST | `/api/retain` | Capture content |
+| POST | `/api/anchor` | Create anchor |
+| POST | `/api/connect` | Create connection |
+| POST | `/api/triage` | Triage signal |
+| POST | `/api/process-queue` | Backfill extractions |
+
+### Wire to Claude Code (MCP)
+For Claude Code MCP tools (retain, recall, etc.), add to `.mcp.json`:
 ```json
 {
   "mcpServers": {
@@ -86,6 +130,7 @@ Add to your project's `.mcp.json`:
   }
 }
 ```
+Note: The MCP stdio server (`src/index.ts`) and the HTTP service (`src/service.ts`) are separate entry points. Both connect to the same FalkorDB data. **Do not run both simultaneously** — they'll compete for the lock. When the HTTP service is running (recommended), Claude Code's MCP tools still work via the spawned stdio process when the service is briefly stopped.
 
 ### Run tests
 ```bash

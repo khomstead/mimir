@@ -108,6 +108,10 @@ export interface TemporalEdge {
   valid_until: number | null;
   confidence: number;
   source_episode_id: string | null;
+  /** Full natural-language fact (Graphiti pattern). Null for structural edges. */
+  fact: string | null;
+  /** List of episode IDs that contributed to this edge (Graphiti provenance pattern). */
+  episode_ids: string[];
 }
 
 // ─── Verb Response Types ─────────────────────────────────────
@@ -235,4 +239,45 @@ export interface ExtractionResult {
   deadline: string | null;
   confidence: number;
   domains: string[];
+  /** Entity upsert intents from Mem0-style extraction (optional — new extraction path only). */
+  entity_actions?: ExtractedEntityWithAction[];
+  /** Fact-bearing edges from Graphiti-style extraction (optional — new extraction path only). */
+  facts?: ExtractedFact[];
+}
+
+// ─── Extraction Intent Types (Mem0 + Graphiti patterns) ──────
+
+/**
+ * Action intent for an entity during extraction.
+ * Ported from Mem0's ADD/UPDATE/DELETE pattern.
+ * - ADD: genuinely new entity, create fresh
+ * - UPDATE: entity exists, merge new info into summary
+ * - INVALIDATE: entity info is contradicted, soft-delete old summary
+ */
+export type EntityAction = "ADD" | "UPDATE" | "INVALIDATE";
+
+export interface ExtractedEntityWithAction {
+  name: string;
+  type: EntityType;
+  canonical_name?: string;
+  /** What the LLM knows about this entity from the current episode */
+  fact_summary: string;
+  /** How this entity relates to existing knowledge */
+  action: EntityAction;
+}
+
+/**
+ * Relationship with a natural-language fact, ported from Graphiti.
+ * Edges are knowledge containers, not just structural links.
+ */
+export interface ExtractedFact {
+  from: string;
+  to: string;
+  edge_type: EdgeType;
+  /** Full natural-language description of the relationship */
+  fact: string;
+  /** When this fact became true (ISO 8601 or null if unknown) */
+  valid_at: string | null;
+  /** When this fact stopped being true (ISO 8601 or null if still true) */
+  invalid_at: string | null;
 }

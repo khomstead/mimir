@@ -9,7 +9,7 @@
  * 5. Returns ranked RecallResponse
  */
 
-import { getGraph, vectorSearch } from "../graph.js";
+import { getGraph, vectorSearch, hydrateNode } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
 import type { RecallResult, RecallResponse } from "../types.js";
 
@@ -163,32 +163,18 @@ async function anchorSearch(
 }
 
 /**
- * Enrich a result with provenance — which Episode it came from.
+ * Enrich a result with full source Episode content.
+ * Uses hydrateNode() — the core hydration primitive.
+ * Returns full episode content (not a truncated snippet).
  */
 async function enrichWithProvenance(
   result: IntermediateResult,
 ): Promise<string | null> {
   if (result.type !== "thought") return null;
 
-  try {
-    const g = getGraph();
-    const epResult = await g.query(
-      `MATCH (t:Thought {id: $id})-[:extracted_from]->(ep:Episode)
-       RETURN ep.content AS content, ep.source_type AS source_type
-       LIMIT 1`,
-      { params: { id: result.id } },
-    );
-
-    if (epResult.data && epResult.data.length > 0) {
-      const row = epResult.data[0] as Record<string, unknown>;
-      const sourceType = row.source_type as string;
-      // Return full episode content — the consumer (GoBot, Observatory)
-      // decides how to use it. Truncating here was the "breadcrumb" problem.
-      const content = row.content as string;
-      return `${sourceType}: ${content}`;
-    }
-  } catch {
-    // Non-fatal
+  const hydrated = await hydrateNode(result.id, "Thought");
+  if (hydrated) {
+    return `${hydrated.source_type}: ${hydrated.content}`;
   }
   return null;
 }

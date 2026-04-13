@@ -11,7 +11,7 @@
  * Usage: bun run src/service.ts
  */
 
-import { initGraph, closeGraph, getGraph, findEntityByName, vectorSearch } from "./graph.js";
+import { initGraph, closeGraph, getGraph, findEntityByName, vectorSearch, hydrateNode } from "./graph.js";
 import { retain } from "./verbs/retain.js";
 import { recall } from "./verbs/recall.js";
 import { pulse } from "./verbs/pulse.js";
@@ -173,48 +173,40 @@ async function handleRequest(req: Request): Promise<Response> {
       }
     }
 
-    // ── Phase 2: Find Entities, hydrate via involves→Episode ──
+    // ── Phase 2: Find Entities, hydrate via hydrateNode() ──
     const entitySections: string[] = [];
+    const seenEntityNames = new Set<string>();
     for (const word of words.slice(0, 5)) {
       const r = await g.query(
         `MATCH (e:Entity)
          WHERE toLower(e.name) CONTAINS toLower($w)
-         OPTIONAL MATCH (e)<-[:involves]-(ep:Episode)
-         RETURN e.name AS name, e.type AS type,
-                ep.content AS episode, ep.source_type AS source
-         ORDER BY ep.timestamp DESC
-         LIMIT 5`,
+         RETURN e.id AS id, e.name AS name, e.type AS type, e.summary AS summary
+         LIMIT 3`,
         { params: { w: word } },
       );
       if (r.data) {
-        // Group episodes by entity name
-        const byEntity: Record<string, { type: string; episodes: string[] }> = {};
         for (const row of r.data as Record<string, unknown>[]) {
           const name = row.name as string;
-          const type = row.type as string;
-          const episode = row.episode as string | null;
+          const id = row.id as string;
+          if (seenEntityNames.has(name)) continue;
+          seenEntityNames.add(name);
 
-          if (!byEntity[name]) byEntity[name] = { type, episodes: [] };
-
-          if (episode) {
-            const key = episode.slice(0, 80);
-            if (seenEpisodes.has(key)) continue;
-            seenEpisodes.add(key);
-            const content = episode.length > MAX_EPISODE_CHARS
-              ? episode.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
-              : episode;
-            byEntity[name].episodes.push(content);
-          }
-        }
-
-        for (const [name, data] of Object.entries(byEntity)) {
-          if (entitySections.find((s) => s.includes(`**${name}**`))) continue;
-          if (data.episodes.length > 0) {
+          // Hydrate: fetch source episode for this entity
+          const hydrated = await hydrateNode(id, "Entity");
+          if (hydrated && !seenEpisodes.has(hydrated.content.slice(0, 80))) {
+            seenEpisodes.add(hydrated.content.slice(0, 80));
+            const content = hydrated.content.length > MAX_EPISODE_CHARS
+              ? hydrated.content.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
+              : hydrated.content;
             entitySections.push(
-              `- **${name}** (${data.type}):\n${data.episodes.join("\n---\n")}`,
+              `- **${name}** (${row.type}): [SOURCE: ${hydrated.source_type}]\n${content}`,
             );
           } else {
-            entitySections.push(`- **${name}** (${data.type}): [no source episodes found]`);
+            // No episode linked — show the entity summary as-is
+            const summary = row.summary as string;
+            entitySections.push(
+              `- **${name}** (${row.type}): ${summary || "[no source material]"}`,
+            );
           }
         }
       }

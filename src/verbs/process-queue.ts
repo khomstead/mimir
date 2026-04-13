@@ -9,10 +9,13 @@
  */
 
 import {
-  getGraph,
   createNode,
   createEdge,
+  createFactEdge,
   findEntityByName,
+  getGraph,
+  updateEntitySummary,
+  invalidateEntitySummary,
 } from "../graph.js";
 import { extractFromText } from "../extraction.js";
 
@@ -77,17 +80,38 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
       const now = Date.now();
       const entityIds: Record<string, string> = {};
 
-      // Create/find entities
-      for (const entity of extraction.entities) {
+      // Create/find entities — matches retain.ts: prefer entity_actions, apply action intents
+      const entityList = extraction.entity_actions ?? extraction.entities.map((e) => ({
+        ...e,
+        fact_summary: "",
+        action: "ADD" as const,
+      }));
+
+      for (const entity of entityList) {
         const searchName = entity.canonical_name || entity.name;
         const existing = await findEntityByName(searchName);
+
         if (existing) {
           entityIds[entity.name] = existing.id;
+
+          // Apply action intent
+          if ("action" in entity) {
+            if (entity.action === "UPDATE" && entity.fact_summary) {
+              await updateEntitySummary(existing.id, entity.fact_summary);
+            } else if (entity.action === "INVALIDATE") {
+              await invalidateEntitySummary(existing.id);
+            }
+            // ADD for existing entity = no-op
+          }
         } else {
+          // New entity — use fact_summary (not content.slice(0, 100))
+          const summary = ("fact_summary" in entity && entity.fact_summary)
+            ? entity.fact_summary
+            : `Mentioned in: ${content.slice(0, 200)}`;
           const newId = await createNode("Entity", {
             name: entity.name,
             type: entity.type,
-            summary: `Mentioned in context: ${content.slice(0, 100)}`,
+            summary,
             synonyms:
               entity.canonical_name && entity.canonical_name !== entity.name
                 ? [entity.canonical_name]
@@ -98,7 +122,7 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
           entityIds[entity.name] = newId;
         }
 
-        // Link entity to episode
+        // Link entity to episode via "involves"
         await createEdge(
           "Episode",
           episodeId,
@@ -109,15 +133,38 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
         );
       }
 
-      // Create relationships
-      for (const rel of extraction.relationships) {
-        const fromId = entityIds[rel.from];
-        const toId = entityIds[rel.to];
-        if (fromId && toId) {
-          await createEdge("Entity", fromId, "Entity", toId, rel.type, {
-            source_episode_id: episodeId,
-            confidence: extraction.confidence,
-          });
+      // Create fact-bearing edges if available (Graphiti pattern)
+      if (extraction.facts && extraction.facts.length > 0) {
+        for (const fact of extraction.facts) {
+          const fromId = entityIds[fact.from];
+          const toId = entityIds[fact.to];
+          if (fromId && toId) {
+            const validAt = fact.valid_at ? new Date(fact.valid_at).getTime() : null;
+            const invalidAt = fact.invalid_at ? new Date(fact.invalid_at).getTime() : null;
+            await createFactEdge(
+              "Entity", fromId,
+              "Entity", toId,
+              fact.edge_type,
+              fact.fact,
+              episodeId,
+              validAt,
+              invalidAt,
+            );
+          }
+        }
+      }
+
+      // Fallback: plain edges from relationships[] when no facts[]
+      if (!extraction.facts || extraction.facts.length === 0) {
+        for (const rel of extraction.relationships) {
+          const fromId = entityIds[rel.from];
+          const toId = entityIds[rel.to];
+          if (fromId && toId) {
+            await createEdge("Entity", fromId, "Entity", toId, rel.type, {
+              source_episode_id: episodeId,
+              confidence: extraction.confidence,
+            });
+          }
         }
       }
 

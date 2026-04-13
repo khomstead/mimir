@@ -121,73 +121,117 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // ── Context (GET /api/context?q=...) ──
-  // Lightweight endpoint for GoBot prompt injection.
-  // Returns formatted text (not JSON) for direct prompt inclusion.
+  // Endpoint for GoBot prompt injection — returns formatted text with full
+  // source material. Implements "Recursive Hydration": when a Thought or
+  // Entity matches, follow edges to the source Episode and return its full
+  // content. This prevents the "breadcrumb without the loaf" problem where
+  // Claude sees truncated fragments and fills in the gaps with hallucinations.
   if (path === "/api/context" && req.method === "GET") {
     const query = url.searchParams.get("q");
     if (!query) return errorResponse("Missing ?q= parameter");
 
     const g = getGraph();
-    const sections: string[] = [];
+    const MAX_EPISODE_CHARS = 2000; // Full episode content, capped for prompt budget
+    const seenEpisodes = new Set<string>(); // Dedupe by episode content prefix
 
-    // Thoughts matching query keywords
+    // ── Phase 1: Find Thoughts matching query, hydrate to source Episodes ──
     const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
-    const seenThoughts = new Set<string>();
+    const thoughtSections: string[] = [];
     for (const word of words.slice(0, 3)) {
       const r = await g.query(
         `MATCH (t:Thought)
          WHERE toLower(t.content) CONTAINS toLower($q)
-         RETURN t.content AS c, t.created_at AS ts
+         OPTIONAL MATCH (t)-[:extracted_from]->(ep:Episode)
+         RETURN t.content AS thought, t.created_at AS ts,
+                ep.content AS episode, ep.source_type AS source
          ORDER BY t.created_at DESC LIMIT 3`,
         { params: { q: word } },
       );
       if (r.data) {
         for (const row of r.data as Record<string, unknown>[]) {
-          const c = (row.c as string)?.slice(0, 200);
-          if (!seenThoughts.has(c)) {
-            seenThoughts.add(c);
-            const d = new Date(row.ts as number).toLocaleDateString();
-            sections.push(`- [${d}] ${c}`);
+          const episode = row.episode as string | null;
+          const thought = row.thought as string;
+          const d = new Date(row.ts as number).toLocaleDateString();
+          const source = row.source as string || "conversation";
+
+          // Prefer full episode; fall back to thought content
+          if (episode) {
+            const key = episode.slice(0, 80);
+            if (seenEpisodes.has(key)) continue;
+            seenEpisodes.add(key);
+            const content = episode.length > MAX_EPISODE_CHARS
+              ? episode.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
+              : episode;
+            thoughtSections.push(`- [${d}] [SOURCE: ${source}]\n${content}`);
+          } else {
+            const key = thought.slice(0, 80);
+            if (seenEpisodes.has(key)) continue;
+            seenEpisodes.add(key);
+            thoughtSections.push(`- [${d}] ${thought}`);
           }
         }
       }
     }
 
-    // Entity matches
-    const entities: Array<{ n: string; t: string; s: string }> = [];
+    // ── Phase 2: Find Entities, hydrate via involves→Episode ──
+    const entitySections: string[] = [];
     for (const word of words.slice(0, 5)) {
       const r = await g.query(
         `MATCH (e:Entity)
          WHERE toLower(e.name) CONTAINS toLower($w)
-         RETURN e.name AS n, e.type AS t, e.summary AS s
-         LIMIT 3`,
+         OPTIONAL MATCH (e)<-[:involves]-(ep:Episode)
+         RETURN e.name AS name, e.type AS type,
+                ep.content AS episode, ep.source_type AS source
+         ORDER BY ep.timestamp DESC
+         LIMIT 5`,
         { params: { w: word } },
       );
       if (r.data) {
+        // Group episodes by entity name
+        const byEntity: Record<string, { type: string; episodes: string[] }> = {};
         for (const row of r.data as Record<string, unknown>[]) {
-          if (!entities.find((e) => e.n === (row as any).n)) {
-            entities.push(row as any);
+          const name = row.name as string;
+          const type = row.type as string;
+          const episode = row.episode as string | null;
+
+          if (!byEntity[name]) byEntity[name] = { type, episodes: [] };
+
+          if (episode) {
+            const key = episode.slice(0, 80);
+            if (seenEpisodes.has(key)) continue;
+            seenEpisodes.add(key);
+            const content = episode.length > MAX_EPISODE_CHARS
+              ? episode.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
+              : episode;
+            byEntity[name].episodes.push(content);
+          }
+        }
+
+        for (const [name, data] of Object.entries(byEntity)) {
+          if (entitySections.find((s) => s.includes(`**${name}**`))) continue;
+          if (data.episodes.length > 0) {
+            entitySections.push(
+              `- **${name}** (${data.type}):\n${data.episodes.join("\n---\n")}`,
+            );
+          } else {
+            entitySections.push(`- **${name}** (${data.type}): [no source episodes found]`);
           }
         }
       }
     }
 
-    // Active anchors
+    // ── Phase 3: Active anchors (unchanged) ──
     const anchorsResult = await g.query(
       `MATCH (a:Anchor) WHERE a.weight > 0 RETURN a.content AS c, a.domain AS d LIMIT 5`,
     );
 
-    // Build text
+    // ── Build output ──
     const out: string[] = [];
-    if (sections.length > 0) {
-      out.push(`**Related thoughts:**\n${sections.slice(0, 5).join("\n")}`);
+    if (thoughtSections.length > 0) {
+      out.push(`**Related knowledge (full source):**\n${thoughtSections.slice(0, 5).join("\n\n")}`);
     }
-    if (entities.length > 0) {
-      out.push(
-        `**Known entities:**\n${entities
-          .map((e) => `- **${e.n}** (${e.t}): ${String(e.s || "").slice(0, 100)}`)
-          .join("\n")}`,
-      );
+    if (entitySections.length > 0) {
+      out.push(`**Known entities (with source material):**\n${entitySections.join("\n\n")}`);
     }
     if (anchorsResult.data && anchorsResult.data.length > 0) {
       out.push(

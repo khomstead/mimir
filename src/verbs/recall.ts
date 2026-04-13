@@ -182,7 +182,9 @@ async function enrichWithProvenance(
     if (epResult.data && epResult.data.length > 0) {
       const row = epResult.data[0] as Record<string, unknown>;
       const sourceType = row.source_type as string;
-      const content = (row.content as string)?.slice(0, 80);
+      // Return full episode content — the consumer (GoBot, Observatory)
+      // decides how to use it. Truncating here was the "breadcrumb" problem.
+      const content = row.content as string;
       return `${sourceType}: ${content}`;
     }
   } catch {

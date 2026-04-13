@@ -18,9 +18,12 @@
 import {
   createNode,
   createEdge,
+  createFactEdge,
   findEntityByName,
   getGraph,
   vectorSearch,
+  updateEntitySummary,
+  invalidateEntitySummary,
 } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
 import { extractFromText } from "../extraction.js";
@@ -87,19 +90,43 @@ export async function retain(
     processed: !isQueued,
   });
 
-  // 3-4. Entity and relationship creation — ONLY when LLM extraction succeeded
+  // 3-4. Entity handling with action intents (Mem0 ADD/UPDATE/INVALIDATE pattern)
   const entityIds: Record<string, string> = {};
   if (!isQueued) {
-    for (const entity of extraction.entities) {
+    // Prefer entity_actions (action-intent-aware) over plain entities
+    const entityList = extraction.entity_actions ?? extraction.entities.map((e) => ({
+      ...e,
+      fact_summary: "",
+      action: "ADD" as const,
+    }));
+
+    for (const entity of entityList) {
       const searchName = entity.canonical_name || entity.name;
       const existing = await findEntityByName(searchName);
+
       if (existing) {
         entityIds[entity.name] = existing.id;
+
+        // Apply action intent
+        if ("action" in entity) {
+          if (entity.action === "UPDATE" && entity.fact_summary) {
+            // Mem0 UPDATE: merge new info into existing summary
+            await updateEntitySummary(existing.id, entity.fact_summary);
+          } else if (entity.action === "INVALIDATE") {
+            // Mem0 INVALIDATE: soft-delete the summary
+            await invalidateEntitySummary(existing.id);
+          }
+          // ADD for existing entity = no-op (already exists)
+        }
       } else {
+        // New entity — create with fact_summary (not content.slice(0, 100))
+        const summary = ("fact_summary" in entity && entity.fact_summary)
+          ? entity.fact_summary
+          : `Mentioned in: ${content.slice(0, 200)}`;
         const newId = await createNode("Entity", {
           name: entity.name,
           type: entity.type,
-          summary: `Mentioned in context: ${content.slice(0, 100)}`,
+          summary,
           synonyms:
             entity.canonical_name && entity.canonical_name !== entity.name
               ? [entity.canonical_name]
@@ -110,7 +137,7 @@ export async function retain(
         entityIds[entity.name] = newId;
       }
 
-      // Link entity to episode via "involves"
+      // Link entity to episode via "involves" (always, regardless of action)
       await createEdge(
         "Episode",
         episodeId,
@@ -121,15 +148,38 @@ export async function retain(
       );
     }
 
-    // Create extracted relationships as edges
-    for (const rel of extraction.relationships) {
-      const fromId = entityIds[rel.from];
-      const toId = entityIds[rel.to];
-      if (fromId && toId) {
-        await createEdge("Entity", fromId, "Entity", toId, rel.type, {
-          source_episode_id: episodeId,
-          confidence: extraction.confidence,
-        });
+    // Create fact-bearing edges (Graphiti pattern) if available
+    if (extraction.facts && extraction.facts.length > 0) {
+      for (const fact of extraction.facts) {
+        const fromId = entityIds[fact.from];
+        const toId = entityIds[fact.to];
+        if (fromId && toId) {
+          const validAt = fact.valid_at ? new Date(fact.valid_at).getTime() : null;
+          const invalidAt = fact.invalid_at ? new Date(fact.invalid_at).getTime() : null;
+          await createFactEdge(
+            "Entity", fromId,
+            "Entity", toId,
+            fact.edge_type,
+            fact.fact,
+            episodeId,
+            validAt,
+            invalidAt,
+          );
+        }
+      }
+    }
+
+    // Fallback: create plain edges from relationships[] if no facts[]
+    if (!extraction.facts || extraction.facts.length === 0) {
+      for (const rel of extraction.relationships) {
+        const fromId = entityIds[rel.from];
+        const toId = entityIds[rel.to];
+        if (fromId && toId) {
+          await createEdge("Entity", fromId, "Entity", toId, rel.type, {
+            source_episode_id: episodeId,
+            confidence: extraction.confidence,
+          });
+        }
       }
     }
   }

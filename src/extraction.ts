@@ -8,6 +8,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { EntityType, EdgeType, ExtractionResult } from "./types.js";
+import { findEntityByName } from "./graph.js";
 
 // ─── Constants ──────────────────────────────────────────────
 
@@ -55,10 +56,29 @@ const EXTRACTION_PROMPT = `You are an entity/relationship extraction engine for 
 Return this exact JSON structure:
 {
   "entities": [
-    { "name": "display name", "type": "person|org|project|concept|domain", "canonical_name": "normalized canonical name for dedup" }
+    { "name": "display name", "type": "person|org|project|concept|domain", "canonical_name": "normalized_snake_case" }
+  ],
+  "entity_actions": [
+    {
+      "name": "entity display name",
+      "type": "person|org|project|concept|domain",
+      "canonical_name": "normalized_snake_case",
+      "fact_summary": "What this episode says about the entity — a complete, standalone description. NOT a fragment.",
+      "action": "ADD|UPDATE|INVALIDATE"
+    }
   ],
   "relationships": [
     { "from": "entity canonical name", "to": "entity canonical name", "type": "relates_to|constrains|involves|contributes_to|tensions_with|scoped_to|demonstrates|discussed_in|progresses_from", "rationale": "brief reason" }
+  ],
+  "facts": [
+    {
+      "from": "entity canonical name",
+      "to": "entity canonical name",
+      "edge_type": "relates_to|constrains|involves|contributes_to",
+      "fact": "Full natural-language description of the relationship. Example: 'Kyle is the technical director of Lighthouse Holyoke'",
+      "valid_at": "ISO 8601 datetime or null if unknown",
+      "invalid_at": "ISO 8601 datetime or null if still true"
+    }
   ],
   "is_anchor": false,
   "anchor_domain": null,
@@ -68,16 +88,25 @@ Return this exact JSON structure:
   "domains": []
 }
 
+ENTITY ACTION RULES:
+- ADD: Entity is not in EXISTING ENTITIES below, or no existing entities provided.
+- UPDATE: Entity exists but the new text adds, corrects, or expands what we know. The fact_summary should be a MERGED description combining old + new info.
+- INVALIDATE: Entity exists but the new text CONTRADICTS the existing summary. This is rare.
+- fact_summary must be a COMPLETE, STANDALONE description — not a fragment. Write it as if someone reading only this field would understand the entity's full context.
+
+FACT RULES:
+- facts[] stores the natural-language description of each relationship.
+- Write facts as full sentences: "Catherine Gobron is the founder of Lighthouse Holyoke" not "founder".
+- Include valid_at if the text implies when the relationship started.
+- Include invalid_at if the text implies the relationship ended.
+
 Rules:
 - Extract entities: people, organizations, projects, concepts, domains mentioned in the text.
-- Use canonical_name for dedup: if text mentions "the school" and "School Project", normalize to one canonical name like "school_project". Canonical names should be lowercase_snake_case.
-- Extract relationships between entities. Use the "from" and "to" fields with the entity canonical_name.
-- is_anchor: true ONLY for deeply held philosophical beliefs, core values, or guiding principles. Most text is NOT an anchor. Be very conservative.
-- anchor_domain: if is_anchor is true, which life domain it belongs to (e.g., "parenting", "career", "relationships", "health", "philosophy").
-- commitment: if the text contains a promise, action item, or commitment, extract it as a short string. Otherwise null.
-- deadline: if a deadline or time reference is mentioned for the commitment, extract it. Otherwise null.
-- confidence: 0.0-1.0 how confident you are in the extraction quality. Higher for clear, explicit text; lower for ambiguous text.
-- domains: list of life/work domains this text touches (e.g., ["work", "family", "health"]).
+- Use canonical_name for dedup: if text mentions "the school" and "School Project", normalize to one canonical name like "school_project".
+- is_anchor: true ONLY for deeply held philosophical beliefs, core values, or guiding principles. Be very conservative.
+- commitment: if the text contains a promise or action item, extract it. Otherwise null.
+- confidence: 0.0-1.0 how confident you are in the extraction quality.
+- domains: list of life/work domains this text touches.
 
 Return ONLY the JSON object. No other text.`;
 
@@ -221,6 +250,31 @@ const COMMON_WORDS = new Set([
 // ─── LLM Extraction ────────────────────────────────────────
 
 /**
+ * Look up existing entity summaries to provide context to the extraction LLM.
+ * Returns a map of entity name → current summary for entities that exist.
+ * This enables the LLM to decide ADD vs UPDATE vs INVALIDATE.
+ */
+async function getExistingEntityContext(
+  text: string,
+): Promise<Record<string, string>> {
+  const namePattern = /\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\b/g;
+  const candidates = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = namePattern.exec(text)) !== null) {
+    if (match[1].length > 2) candidates.add(match[1]);
+  }
+
+  const context: Record<string, string> = {};
+  for (const name of Array.from(candidates).slice(0, 10)) {
+    const entity = await findEntityByName(name);
+    if (entity) {
+      context[entity.name] = entity.summary;
+    }
+  }
+  return context;
+}
+
+/**
  * Parse and validate the LLM's JSON response into an ExtractionResult.
  * Falls back to fallbackExtraction if parsing fails.
  */
@@ -266,9 +320,36 @@ function parseExtractionResponse(
         )
       : [];
 
+    const entity_actions = Array.isArray(parsed.entity_actions)
+      ? parsed.entity_actions.map(
+          (ea: any) => ({
+            name: String(ea.name ?? ""),
+            type: validateEntityType(String(ea.type ?? "concept")),
+            canonical_name: ea.canonical_name ? String(ea.canonical_name) : undefined,
+            fact_summary: String(ea.fact_summary ?? ""),
+            action: ["ADD", "UPDATE", "INVALIDATE"].includes(ea.action) ? ea.action : "ADD",
+          }),
+        )
+      : undefined;
+
+    const facts = Array.isArray(parsed.facts)
+      ? parsed.facts.map(
+          (f: any) => ({
+            from: String(f.from ?? ""),
+            to: String(f.to ?? ""),
+            edge_type: validateEdgeType(String(f.edge_type ?? "relates_to")),
+            fact: String(f.fact ?? ""),
+            valid_at: f.valid_at ? String(f.valid_at) : null,
+            invalid_at: f.invalid_at ? String(f.invalid_at) : null,
+          }),
+        )
+      : undefined;
+
     return {
       entities,
+      entity_actions,
       relationships,
+      facts,
       is_anchor: Boolean(parsed.is_anchor),
       anchor_domain: parsed.anchor_domain
         ? String(parsed.anchor_domain)
@@ -349,11 +430,21 @@ export async function extractFromText(
   try {
     const client = new Anthropic({ apiKey });
 
+    // Fetch existing entity context so the LLM can decide ADD vs UPDATE
+    const existingContext = await getExistingEntityContext(text);
+    const contextBlock = Object.keys(existingContext).length > 0
+      ? `\n\nEXISTING ENTITIES (use for ADD/UPDATE/INVALIDATE decisions):\n${
+          Object.entries(existingContext)
+            .map(([name, summary]) => `- ${name}: ${summary}`)
+            .join("\n")
+        }`
+      : "";
+
     const response = await client.messages.create({
       model,
-      max_tokens: 1024,
+      max_tokens: 2048,
       system: EXTRACTION_PROMPT,
-      messages: [{ role: "user", content: text }],
+      messages: [{ role: "user", content: text + contextBlock }],
     });
 
     // Extract text from the response

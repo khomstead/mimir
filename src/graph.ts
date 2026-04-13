@@ -223,3 +223,154 @@ export async function vectorSearch(
     created_at: row.created_at as number,
   }));
 }
+
+/**
+ * Hydrate a node with its source Episode content.
+ * Follows extracted_from (Thought→Episode) or involves (Episode→Entity) edges.
+ * Returns the full Episode content, or null if no linked episode exists.
+ *
+ * This is the "Recursive Hydration" pattern from R2R/Graphiti —
+ * finding a node is Phase 1, fetching its source material is Phase 2.
+ */
+export async function hydrateNode(
+  nodeId: string,
+  nodeLabel: "Thought" | "Entity",
+): Promise<{ episodeId: string; content: string; source_type: string } | null> {
+  const g = getGraph();
+
+  let cypher: string;
+  if (nodeLabel === "Thought") {
+    // Thought -[extracted_from]-> Episode
+    cypher = `
+      MATCH (t:Thought {id: $id})-[:extracted_from]->(ep:Episode)
+      RETURN ep.id AS episodeId, ep.content AS content, ep.source_type AS source_type
+      LIMIT 1`;
+  } else {
+    // Entity <-[involves]- Episode (reverse direction)
+    cypher = `
+      MATCH (e:Entity {id: $id})<-[:involves]-(ep:Episode)
+      RETURN ep.id AS episodeId, ep.content AS content, ep.source_type AS source_type
+      ORDER BY ep.timestamp DESC
+      LIMIT 1`;
+  }
+
+  try {
+    const result = await g.query(cypher, { params: { id: nodeId } });
+    if (result.data && result.data.length > 0) {
+      const row = result.data[0] as Record<string, unknown>;
+      return {
+        episodeId: row.episodeId as string,
+        content: row.content as string,
+        source_type: row.source_type as string,
+      };
+    }
+  } catch {
+    // Non-fatal — node may not have an episode link
+  }
+  return null;
+}
+
+/**
+ * Update an entity's summary by merging new information via LLM.
+ * Ported from Mem0's UPDATE pattern — the LLM sees the old summary
+ * and the new episode context, then produces a merged summary.
+ *
+ * Also updates the `updated_at` timestamp.
+ */
+export async function updateEntitySummary(
+  entityId: string,
+  newSummary: string,
+): Promise<void> {
+  const g = getGraph();
+  await g.query(
+    `MATCH (e:Entity {id: $id})
+     SET e.summary = $summary, e.updated_at = $now`,
+    { params: { id: entityId, summary: newSummary, now: Date.now() } },
+  );
+}
+
+/**
+ * Soft-invalidate an entity's summary (Mem0 DELETE/INVALIDATE pattern).
+ * Prepends "[INVALIDATED]" to the summary rather than deleting the node.
+ * The entity and its edges are preserved for historical graph traversal.
+ */
+export async function invalidateEntitySummary(
+  entityId: string,
+): Promise<void> {
+  const g = getGraph();
+  await g.query(
+    `MATCH (e:Entity {id: $id})
+     SET e.summary = '[INVALIDATED] ' + e.summary, e.updated_at = $now`,
+    { params: { id: entityId, now: Date.now() } },
+  );
+}
+
+/**
+ * Create a fact-bearing edge between two nodes.
+ * Ported from Graphiti — edges store natural-language facts,
+ * temporal validity windows, and provenance episode lists.
+ *
+ * If a similar edge already exists (same from/to/type), appends
+ * the episode to the existing edge's provenance list instead of
+ * creating a duplicate (Graphiti dedup pattern).
+ */
+export async function createFactEdge(
+  fromLabel: string,
+  fromId: string,
+  toLabel: string,
+  toId: string,
+  edgeType: EdgeType,
+  fact: string,
+  episodeId: string,
+  validAt?: number | null,
+  invalidAt?: number | null,
+): Promise<void> {
+  const g = getGraph();
+  const now = Date.now();
+
+  // Check for existing edge of same type between same nodes
+  const existing = await g.query(
+    `MATCH (a:${fromLabel} {id: $fromId})-[r:${edgeType}]->(b:${toLabel} {id: $toId})
+     RETURN r.source_episode_id AS epId, r.fact AS fact
+     LIMIT 1`,
+    { params: { fromId, toId } },
+  );
+
+  if (existing.data && existing.data.length > 0) {
+    // Edge exists — update fact and append episode to provenance
+    await g.query(
+      `MATCH (a:${fromLabel} {id: $fromId})-[r:${edgeType}]->(b:${toLabel} {id: $toId})
+       SET r.fact = $fact,
+           r.episode_ids = coalesce(r.episode_ids, []) + [$episodeId],
+           r.valid_until = $invalidAt`,
+      { params: { fromId, toId, fact, episodeId, invalidAt: invalidAt ?? null } },
+    );
+  } else {
+    // New edge
+    await g.query(
+      `MATCH (a:${fromLabel} {id: $fromId}), (b:${toLabel} {id: $toId})
+       CREATE (a)-[r:${edgeType} {
+         type: $type,
+         fact: $fact,
+         created_at: $now,
+         valid_from: $validFrom,
+         valid_until: $validUntil,
+         confidence: 1.0,
+         source_episode_id: $episodeId,
+         episode_ids: [$episodeId]
+       }]->(b)`,
+      {
+        params: {
+          fromId,
+          toId,
+          type: edgeType,
+          fact,
+          now,
+          validFrom: validAt ?? now,
+          validUntil: invalidAt ?? null,
+          episodeId,
+        },
+      },
+    );
+  }
+}

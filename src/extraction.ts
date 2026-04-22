@@ -9,6 +9,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { EntityType, EdgeType, ExtractionResult } from "./types.js";
 import { findEntityByName } from "./graph.js";
+import { recordMimirCost } from "./cost-tracking.js";
 
 // ─── Constants ──────────────────────────────────────────────
 
@@ -440,11 +441,20 @@ export async function extractFromText(
         }`
       : "";
 
+    const extractionStartedAt = Date.now();
     const response = await client.messages.create({
       model,
       max_tokens: 2048,
       system: EXTRACTION_PROMPT,
       messages: [{ role: "user", content: text + contextBlock }],
+    });
+
+    recordMimirCost({
+      operation: "mimir_extraction",
+      model,
+      usage: response.usage,
+      durationMs: Date.now() - extractionStartedAt,
+      requestId: response.id,
     });
 
     // Extract text from the response

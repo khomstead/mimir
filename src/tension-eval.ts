@@ -7,6 +7,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import { recordMimirCost } from "./cost-tracking.js";
 
 const EVAL_MODEL = process.env.MIMIR_TENSION_MODEL || "claude-sonnet-4-5-20250514";
 
@@ -68,6 +69,7 @@ export async function evaluateTension(
 
   try {
     const client = new Anthropic({ apiKey });
+    const tensionStartedAt = Date.now();
     const response = await client.messages.create({
       model: EVAL_MODEL,
       max_tokens: 256,
@@ -78,6 +80,14 @@ export async function evaluateTension(
           content: `ANCHOR: ${anchorContent}\n\nNEW CONTENT: ${newContent}`,
         },
       ],
+    });
+
+    recordMimirCost({
+      operation: "mimir_tension",
+      model: EVAL_MODEL,
+      usage: response.usage,
+      durationMs: Date.now() - tensionStartedAt,
+      requestId: response.id,
     });
 
     const textBlock = response.content.find((b) => b.type === "text");

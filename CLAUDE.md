@@ -2,6 +2,16 @@
 
 > Claude Code reads this file automatically. It describes the architecture, patterns, and conventions for the Mimir knowledge graph service.
 
+## ⚠️ MULTI-TENANCY: NOT SUPPORTED
+
+**Mimir is single-tenant by design as of 2026-05-09.** Every Episode, Entity, Thought, Anchor, and Edge in the graph belongs to one human user (Kyle, in our deployment). There is no `userId` / `tenant` / `namespace` field on any node. All retain / recall / pulse / reflect calls return data across the whole graph.
+
+**Do NOT add a second user without doing the userId-scoping refactor first.** Onboarding user #2 against this single-tenant graph would mix their captured preferences, places, and events into Kyle's pattern-of-life intelligence (and vice versa) — a data leak that breaks the trust model on day one.
+
+The refactor is tracked as gobot task #62: schema-add `userId` to every node, require `X-Mimir-User-Id` on every HTTP call, thread userId through `mimir-client.ts` and `processIntents`, write a migration that tags existing data with Kyle's userId. Rough estimate: 1–2 days of focused work, plus a design conversation about shared knowledge (partnership journal, ops graph, family-shared facts) — does that live in a separate "shared" namespace, or per-user with explicit shares?
+
+Until that refactor lands, the GoBot daemon enforces single-tenant operation at startup: if `GOBOT_DEFAULT_USER_ID` is unset AND Mimir is reachable, the daemon refuses to start. That gate prevents silent degradation when the Phase-1 fallback is removed prematurely.
+
 ## What Mimir Is
 
 Mimir is a **thought partner intelligence layer** — a persistent graph-backed service that holds knowledge, surfaces connections, tracks how ideas mature over time, and processes signals through an intelligence layer that understands context. It is NOT a personal assistant with good memory. It is the memory and reasoning substrate that any AI client (Claude, Gemini, local models) can query via 7 MCP verbs or HTTP API.

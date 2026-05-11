@@ -13,6 +13,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { initGraph, closeGraph } from "./graph.js";
+import { forget } from "./verbs/forget.js";
 import { retain } from "./verbs/retain.js";
 import { recall } from "./verbs/recall.js";
 import { pulse } from "./verbs/pulse.js";
@@ -52,10 +53,19 @@ server.tool(
       .optional()
       .default([])
       .describe("People involved in this conversation or observation"),
+    event_at: z
+      .string()
+      .optional()
+      .describe(
+        "ISO 8601 datetime of when this event actually occurred (may differ from now). " +
+        "Example: '2026-05-05T14:00:00' for an event that happened last Tuesday. " +
+        "Omit to default to the current time (ingestion time = event time)."
+      ),
   },
-  async ({ content, source, participants }) => {
+  async ({ content, source, participants, event_at }) => {
     try {
-      const result = await retain(content, source, participants);
+      const eventAt = event_at ? new Date(event_at).getTime() : undefined;
+      const result = await retain(content, source, participants, eventAt);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };
@@ -85,14 +95,29 @@ server.tool(
       .number()
       .optional()
       .describe("Only return results created before this Unix timestamp (ms)"),
+    as_of: z
+      .number()
+      .optional()
+      .describe(
+        "Point-in-time query: only return knowledge that existed at this Unix timestamp (ms). " +
+        "Lets you reconstruct what Mimir knew at a past moment."
+      ),
+    intent: z
+      .enum(["when", "who", "why", "what", "how"])
+      .optional()
+      .describe(
+        "Query intent hint — shapes retrieval strategy. " +
+        "'when' → temporal Episode-first search; 'who' → entity-focused; " +
+        "'why' → causal; 'what'/'how' → default."
+      ),
   },
-  async ({ query, scope, time_range_from, time_range_to }) => {
+  async ({ query, scope, time_range_from, time_range_to, as_of, intent }) => {
     try {
       const timeRange =
         time_range_from || time_range_to
           ? { from: time_range_from, to: time_range_to }
           : undefined;
-      const result = await recall(query, scope, timeRange);
+      const result = await recall(query, scope, timeRange, as_of, intent as any);
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
       };
@@ -289,6 +314,41 @@ server.tool(
     } catch (err: any) {
       return {
         content: [{ type: "text" as const, text: `Error in process_queue: ${err.message}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+// --- forget tool ---
+server.tool(
+  "forget",
+  "Retract knowledge about a named entity or specific episode. " +
+    "Marks the entity summary as [RETRACTED] and invalidates all derived fact edges. " +
+    "Source Episodes and Thoughts are preserved as immutable ground truth.",
+  {
+    entity: z
+      .string()
+      .optional()
+      .describe("Name of the entity to retract (e.g. 'Kyle', 'De la Luz Soundstage')."),
+    episode_id: z
+      .string()
+      .optional()
+      .describe("UUID of the Episode whose derived facts should be retracted."),
+    reason: z
+      .string()
+      .optional()
+      .describe("Human-readable reason for retraction (stored for audit trail)."),
+  },
+  async ({ entity, episode_id, reason }) => {
+    try {
+      const result = await forget(entity || null, reason, episode_id);
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err: any) {
+      return {
+        content: [{ type: "text" as const, text: `Error in forget: ${err.message}` }],
         isError: true,
       };
     }

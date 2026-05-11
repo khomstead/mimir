@@ -7,7 +7,23 @@
 
 import { FalkorDB } from "falkordblite";
 import type { Graph } from "falkordb";
-import type { EdgeType } from "./types.js";
+import type { EdgeType, BeliefState } from "./types.js";
+
+/**
+ * Source authority scores — used for contradiction resolution.
+ * Higher authority wins when two facts conflict.
+ * Derived from Pith + Mem0 authority-weighted belief revision.
+ */
+export const SOURCE_AUTHORITY: Record<string, number> = {
+  voice: 0.9,       // user-spoken directly to Mosscap
+  manual: 0.85,     // user-typed directly
+  chat: 0.85,       // Observatory text chat
+  meeting: 0.8,     // meeting notes
+  email: 0.7,       // secondhand / forwarded info
+  distillation: 0.5, // LLM distillation pass
+};
+/** Fallback authority when source type isn't in the mapping (e.g. background extraction). */
+export const DEFAULT_AUTHORITY = 0.6;
 
 let db: FalkorDB | null = null;
 let graph: Graph | null = null;
@@ -40,6 +56,9 @@ export async function initGraph(dataPath: string): Promise<Graph> {
     .catch(() => {});
   await graph
     .query("CREATE INDEX FOR (ep:Episode) ON (ep.timestamp)")
+    .catch(() => {});
+  await graph
+    .query("CREATE INDEX FOR (ep:Episode) ON (ep.event_at)")
     .catch(() => {});
   await graph
     .query(
@@ -310,6 +329,9 @@ export async function invalidateEntitySummary(
  * Ported from Graphiti — edges store natural-language facts,
  * temporal validity windows, and provenance episode lists.
  *
+ * Now also stores belief_state and source_authority for Phase 4
+ * authority-weighted contradiction resolution.
+ *
  * If a similar edge already exists (same from/to/type), appends
  * the episode to the existing edge's provenance list instead of
  * creating a duplicate (Graphiti dedup pattern).
@@ -324,6 +346,8 @@ export async function createFactEdge(
   episodeId: string,
   validAt?: number | null,
   invalidAt?: number | null,
+  sourceAuthority: number = DEFAULT_AUTHORITY,
+  beliefState: BeliefState = "asserted",
 ): Promise<void> {
   const g = getGraph();
   const now = Date.now();
@@ -337,16 +361,18 @@ export async function createFactEdge(
   );
 
   if (existing.data && existing.data.length > 0) {
-    // Edge exists — update fact and append episode to provenance
+    // Edge exists — update fact, provenance, and authority metadata
     await g.query(
       `MATCH (a:${fromLabel} {id: $fromId})-[r:${edgeType}]->(b:${toLabel} {id: $toId})
        SET r.fact = $fact,
            r.episode_ids = coalesce(r.episode_ids, []) + [$episodeId],
-           r.valid_until = $invalidAt`,
-      { params: { fromId, toId, fact, episodeId, invalidAt: invalidAt ?? null } },
+           r.valid_until = $invalidAt,
+           r.source_authority = $sourceAuthority,
+           r.belief_state = $beliefState`,
+      { params: { fromId, toId, fact, episodeId, invalidAt: invalidAt ?? null, sourceAuthority, beliefState } },
     );
   } else {
-    // New edge
+    // New edge — include belief_state and source_authority from the start
     await g.query(
       `MATCH (a:${fromLabel} {id: $fromId}), (b:${toLabel} {id: $toId})
        CREATE (a)-[r:${edgeType} {
@@ -357,7 +383,9 @@ export async function createFactEdge(
          valid_until: $validUntil,
          confidence: 1.0,
          source_episode_id: $episodeId,
-         episode_ids: [$episodeId]
+         episode_ids: [$episodeId],
+         belief_state: $beliefState,
+         source_authority: $sourceAuthority
        }]->(b)`,
       {
         params: {
@@ -369,8 +397,32 @@ export async function createFactEdge(
           validFrom: validAt ?? now,
           validUntil: invalidAt ?? null,
           episodeId,
+          beliefState,
+          sourceAuthority,
         },
       },
     );
   }
+}
+
+/**
+ * Update the belief_state of all fact edges created by a specific episode.
+ * Used by contradiction detection to mark facts as confirmed/weakened/questioned.
+ */
+export async function updateFactEdgeBeliefState(
+  fromLabel: string,
+  fromId: string,
+  toLabel: string,
+  toId: string,
+  edgeType: EdgeType,
+  episodeId: string,
+  newBeliefState: BeliefState,
+): Promise<void> {
+  const g = getGraph();
+  await g.query(
+    `MATCH (a:${fromLabel} {id: $fromId})-[r:${edgeType}]->(b:${toLabel} {id: $toId})
+     WHERE r.source_episode_id = $episodeId
+     SET r.belief_state = $beliefState`,
+    { params: { fromId, toId, episodeId, beliefState: newBeliefState } },
+  );
 }

@@ -12,11 +12,15 @@ import {
   createNode,
   createEdge,
   createFactEdge,
+  updateFactEdgeBeliefState,
   findEntityByName,
   getGraph,
   updateEntitySummary,
   invalidateEntitySummary,
+  SOURCE_AUTHORITY,
+  DEFAULT_AUTHORITY,
 } from "../graph.js";
+import type { EdgeType, BeliefState } from "../types.js";
 import { extractFromText } from "../extraction.js";
 
 export interface QueueProcessResult {
@@ -32,6 +36,59 @@ export interface QueueProcessResult {
 }
 
 /**
+ * Authority-weighted contradiction detection (Phase 4 — Pith/Mem0 pattern).
+ *
+ * After creating a new fact edge, checks for existing fact edges of the same
+ * type between the same entity pair. Compares source_authority scores and
+ * updates belief_state accordingly:
+ *   new > old → old = weakened, new = confirmed
+ *   new < old → new = questioned
+ *   new = old → both remain asserted (parallel beliefs, let human resolve)
+ *
+ * Only considers edges that are still active (valid_until IS NULL) and not
+ * already retracted, to avoid re-adjudicating settled facts.
+ */
+async function resolveContradictions(
+  fromId: string,
+  toId: string,
+  edgeType: EdgeType,
+  currentEpisodeId: string,
+  currentAuthority: number,
+): Promise<void> {
+  const g = getGraph();
+
+  // Find all active fact edges of the same type between the same entities,
+  // EXCLUDING the one we just created (different source_episode_id)
+  const conflicts = await g.query(
+    `MATCH (a:Entity {id: $fromId})-[r:${edgeType}]->(b:Entity {id: $toId})
+     WHERE r.source_episode_id <> $currentEpisodeId
+       AND r.valid_until IS NULL
+       AND r.belief_state IN ['asserted', 'confirmed', 'questioned']
+     RETURN r.source_episode_id AS old_ep_id,
+            r.source_authority AS old_authority,
+            r.belief_state AS old_state`,
+    { params: { fromId, toId, currentEpisodeId } },
+  );
+
+  if (!conflicts.data || conflicts.data.length === 0) return;
+
+  for (const row of conflicts.data as Record<string, unknown>[]) {
+    const oldEpId = row.old_ep_id as string;
+    const oldAuthority = (row.old_authority as number) ?? DEFAULT_AUTHORITY;
+
+    if (currentAuthority > oldAuthority) {
+      // Current fact is higher authority — weaken the old, confirm the current
+      await updateFactEdgeBeliefState("Entity", fromId, "Entity", toId, edgeType, oldEpId, "weakened");
+      await updateFactEdgeBeliefState("Entity", fromId, "Entity", toId, edgeType, currentEpisodeId, "confirmed");
+    } else if (currentAuthority < oldAuthority) {
+      // Old fact is higher authority — question the current
+      await updateFactEdgeBeliefState("Entity", fromId, "Entity", toId, edgeType, currentEpisodeId, "questioned");
+    }
+    // Equal authority: leave both as "asserted" — let human review resolve
+  }
+}
+
+/**
  * Process all unprocessed Episodes in the graph.
  * Runs LLM extraction on each, creates entities/relationships,
  * and marks the Episode as processed.
@@ -41,11 +98,11 @@ export interface QueueProcessResult {
 export async function processQueue(limit: number = 20): Promise<QueueProcessResult> {
   const g = getGraph();
 
-  // Find unprocessed episodes
+  // Find unprocessed episodes (include source_type for authority derivation)
   const unprocessed = await g.query(
     `MATCH (ep:Episode)
      WHERE ep.processed = false
-     RETURN ep.id AS id, ep.content AS content
+     RETURN ep.id AS id, ep.content AS content, ep.source_type AS source_type
      ORDER BY ep.timestamp ASC
      LIMIT $limit`,
     { params: { limit } },
@@ -65,6 +122,11 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
   for (const row of unprocessed.data as Record<string, unknown>[]) {
     const episodeId = row.id as string;
     const content = row.content as string;
+    // Map Episode.source_type to source authority (consolidation worker = background extraction)
+    const sourceType = (row.source_type as string) || "conversation";
+    // Episodes processed by the consolidation worker get a slightly lower authority
+    // than those processed inline by retain() — they went through a deferred path.
+    const authority = SOURCE_AUTHORITY[sourceType] ?? DEFAULT_AUTHORITY;
 
     try {
       // Run extraction
@@ -134,6 +196,7 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
       }
 
       // Create fact-bearing edges if available (Graphiti pattern)
+      // Phase 4: pass source_authority and run contradiction detection after each edge.
       if (extraction.facts && extraction.facts.length > 0) {
         for (const fact of extraction.facts) {
           const fromId = entityIds[fact.from];
@@ -149,7 +212,13 @@ export async function processQueue(limit: number = 20): Promise<QueueProcessResu
               episodeId,
               validAt,
               invalidAt,
+              authority,
+              "asserted",
             );
+            // Run authority-weighted contradiction detection for this fact edge.
+            // Non-fatal: if it errors, the fact was still stored correctly.
+            await resolveContradictions(fromId, toId, fact.edge_type, episodeId, authority)
+              .catch((err) => console.error(`[contradiction] ${err.message}`));
           }
         }
       }

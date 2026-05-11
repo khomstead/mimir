@@ -18,6 +18,9 @@ interface TimeRange {
   to?: number;
 }
 
+/** Intent hint shapes which retrieval strategies run and how results are ranked. */
+type RecallIntent = "when" | "who" | "why" | "what" | "how";
+
 interface IntermediateResult {
   id: string;
   content: string;
@@ -62,10 +65,13 @@ async function semanticSearch(
  * Strategy 2: Graph traversal — text match + entity connections.
  * Finds Thoughts whose content contains the query text (case-insensitive),
  * and traverses connections to related entities.
+ *
+ * @param asOf  - If set, exclude Thoughts ingested after this Unix timestamp (ms).
  */
 async function graphSearch(
   query: string,
   timeRange?: TimeRange,
+  asOf?: number,
 ): Promise<IntermediateResult[]> {
   try {
     const g = getGraph();
@@ -80,6 +86,11 @@ async function graphSearch(
     if (timeRange?.to !== undefined) {
       timeFilter += " AND t.created_at <= $to";
       params.to = timeRange.to;
+    }
+    if (asOf !== undefined) {
+      // Point-in-time filter: only include Thoughts that existed at `asOf`
+      timeFilter += " AND t.created_at <= $asOf";
+      params.asOf = asOf;
     }
 
     const result = await g.query(
@@ -111,13 +122,72 @@ async function graphSearch(
 }
 
 /**
+ * Strategy 4 (temporal): Episode-first search by event_at.
+ * Used when intent = 'when'. Searches Episodes by event time (not ingestion time),
+ * returns associated Thought content sorted by when events occurred.
+ *
+ * @param asOf - Only return Episodes with event_at <= asOf.
+ */
+async function temporalSearch(
+  query: string,
+  asOf?: number,
+): Promise<IntermediateResult[]> {
+  try {
+    const g = getGraph();
+
+    const params: Record<string, unknown> = { query: query.toLowerCase() };
+    let asOfFilter = "";
+    if (asOf !== undefined) {
+      asOfFilter = " AND ep.event_at <= $asOf";
+      params.asOf = asOf;
+    }
+
+    // Find Episodes whose content matches the query, filtered by event_at
+    const result = await g.query(
+      `MATCH (ep:Episode)
+       WHERE toLower(ep.content) CONTAINS $query${asOfFilter}
+       OPTIONAL MATCH (t:Thought)-[:extracted_from]->(ep)
+       RETURN ep.id AS ep_id, ep.content AS ep_content,
+              ep.event_at AS event_at, ep.timestamp AS ingested_at,
+              t.id AS thought_id, t.content AS thought_content,
+              t.created_at AS thought_created_at
+       ORDER BY ep.event_at DESC
+       LIMIT 10`,
+      { params },
+    );
+
+    if (!result.data || result.data.length === 0) {
+      return [];
+    }
+
+    return (result.data as Record<string, unknown>[])
+      .filter((row) => row.thought_id !== null)
+      .map((row) => ({
+        id: row.thought_id as string,
+        content: row.thought_content as string,
+        type: "thought" as const,
+        score: 0.75, // Temporal matches are high-confidence for 'when' queries
+        source: "temporal",
+        created_at: row.thought_created_at as number,
+        connections: [],
+        strategies: new Set(["temporal"]),
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Strategy 3: Anchor search.
  * Finds Anchors whose content or domain matches the query.
  * Anchors always rank high (they're foundational).
+ *
+ * @param asOf - If set, exclude Anchors created after this Unix timestamp (ms).
  */
 async function anchorSearch(
   query: string,
   timeRange?: TimeRange,
+  asOf?: number,
 ): Promise<IntermediateResult[]> {
   try {
     const g = getGraph();
@@ -132,6 +202,10 @@ async function anchorSearch(
     if (timeRange?.to !== undefined) {
       timeFilter += " AND a.created_at <= $to";
       params.to = timeRange.to;
+    }
+    if (asOf !== undefined) {
+      timeFilter += " AND a.created_at <= $asOf";
+      params.asOf = asOf;
     }
 
     const result = await g.query(
@@ -182,32 +256,60 @@ async function enrichWithProvenance(
 /**
  * Recall — multi-strategy retrieval from the Brain.
  *
- * @param query - Natural language query string
- * @param scope - Optional scope filter (unused in MVP, reserved for future)
+ * @param query     - Natural language query string
+ * @param scope     - Optional scope filter (reserved for future use)
  * @param timeRange - Optional temporal filter { from?: epochMs, to?: epochMs }
+ * @param asOf      - Point-in-time query: only return content that existed at this epoch ms.
+ *                    Implemented as an additional upper-bound on Thought.created_at and
+ *                    Episode.event_at (for temporal strategy). Chronos-inspired.
+ * @param intent    - Query intent hint. Shapes which strategies run and how results are ranked:
+ *                    'when' → Episode-first temporal search, sorted by event_at
+ *                    'who'  → entity subgraph traversal (boosts graph results)
+ *                    'why'  → causal traversal (boosts graph results)
+ *                    'what' | 'how' → default semantic + graph behavior
  */
 export async function recall(
   query: string,
   scope?: string,
   timeRange?: TimeRange,
+  asOf?: number,
+  intent?: RecallIntent,
 ): Promise<RecallResponse> {
-  // Run all three strategies in parallel
-  const [semanticResults, graphResults, anchorResults] = await Promise.all([
-    semanticSearch(query),
-    graphSearch(query, timeRange),
-    anchorSearch(query, timeRange),
-  ]);
+  // Intent='when': run temporal Episode search alongside standard strategies.
+  // Other intents use standard strategies but with score adjustments below.
+  const useTemporalStrategy = intent === "when";
+
+  // Run strategies in parallel based on intent
+  const [semanticResults, graphResults, anchorResults, temporalResults] =
+    await Promise.all([
+      semanticSearch(query),
+      graphSearch(query, timeRange, asOf),
+      anchorSearch(query, timeRange, asOf),
+      useTemporalStrategy ? temporalSearch(query, asOf) : Promise.resolve([] as IntermediateResult[]),
+    ]);
+
+  // Post-filter semantic results by asOf (vector search doesn't support pre-filtering)
+  const filteredSemanticResults = asOf !== undefined
+    ? semanticResults.filter((r) => r.created_at <= asOf)
+    : semanticResults;
+
+  // Apply intent-based score adjustments
+  if (intent === "who" || intent === "why") {
+    // Boost graph results for entity/causal queries; they surface entity connections
+    for (const r of graphResults) r.score = Math.min(1.0, r.score + 0.1);
+  }
 
   // Track which strategies returned results
   const strategiesUsed: string[] = [];
-  if (semanticResults.length > 0) strategiesUsed.push("semantic");
+  if (filteredSemanticResults.length > 0) strategiesUsed.push("semantic");
   if (graphResults.length > 0) strategiesUsed.push("graph");
   if (anchorResults.length > 0) strategiesUsed.push("anchor");
+  if (temporalResults.length > 0) strategiesUsed.push("temporal");
 
   // Merge into a Map by ID (deduplicate)
   const merged = new Map<string, IntermediateResult>();
 
-  for (const resultSet of [semanticResults, graphResults, anchorResults]) {
+  for (const resultSet of [filteredSemanticResults, graphResults, anchorResults, temporalResults]) {
     for (const r of resultSet) {
       const existing = merged.get(r.id);
       if (existing) {
@@ -256,5 +358,7 @@ export async function recall(
     results,
     query,
     strategies_used: strategiesUsed,
+    ...(asOf !== undefined && { as_of: asOf }),
+    ...(intent !== undefined && { intent }),
   };
 }

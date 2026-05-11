@@ -83,6 +83,30 @@ export interface ArtifactNode {
   created_at: number;
 }
 
+// ─── Belief State (Pith five-state lifecycle) ────────────────
+
+/**
+ * Tracks the epistemic status of a fact edge.
+ * Modeled after Pith's cognitive governance architecture.
+ *
+ * asserted   → newly stored fact, not yet corroborated or challenged
+ * confirmed  → higher-authority source has corroborated this fact
+ * questioned → equal-authority source has offered a conflicting claim
+ * weakened   → higher-authority source has contradicted this fact
+ * retracted  → explicitly invalidated (forget() verb or manual review)
+ *
+ * Contradiction detection uses source_authority to choose the outcome:
+ * new.authority > old.authority → old = weakened, new = confirmed
+ * new.authority < old.authority → new = questioned
+ * new.authority = old.authority → both = asserted (parallel beliefs)
+ */
+export type BeliefState =
+  | "asserted"
+  | "confirmed"
+  | "questioned"
+  | "weakened"
+  | "retracted";
+
 // ─── Edge Types ──────────────────────────────────────────────
 
 export type EdgeType =
@@ -112,6 +136,10 @@ export interface TemporalEdge {
   fact: string | null;
   /** List of episode IDs that contributed to this edge (Graphiti provenance pattern). */
   episode_ids: string[];
+  /** Epistemic status of this fact (Pith five-state lifecycle). */
+  belief_state: BeliefState;
+  /** Trust score for the source that created this edge (0.0–1.0). */
+  source_authority: number;
 }
 
 // ─── Verb Response Types ─────────────────────────────────────

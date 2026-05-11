@@ -24,6 +24,8 @@ import {
   vectorSearch,
   updateEntitySummary,
   invalidateEntitySummary,
+  SOURCE_AUTHORITY,
+  DEFAULT_AUTHORITY,
 } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
 import { extractFromText } from "../extraction.js";
@@ -74,19 +76,37 @@ export async function retain(
   content: string,
   source: string = "manual",
   participants: string[] = [],
+  eventAt?: number,
 ): Promise<RetainResponse> {
   const now = Date.now();
 
+  // MIMIR_FAST_RETAIN: dual-stream fast path (MAGMA pattern).
+  // When enabled, retain() skips all LLM extraction and immediately returns —
+  // the consolidation worker handles extraction asynchronously in the background.
+  // This makes every retain() call O(1) graph append, never blocked by LLM latency.
+  const fastRetain = process.env.MIMIR_FAST_RETAIN === "true";
+
   // 1. Extract entities and relationships via LLM (may return queued sentinel)
-  const extraction = await extractFromText(content);
-  const isQueued = "queued" in extraction && extraction.queued === true;
+  // In fast-retain mode, always defer to the consolidation worker.
+  let extraction: Awaited<ReturnType<typeof extractFromText>>;
+  let isQueued: boolean;
+  if (fastRetain) {
+    isQueued = true;
+    extraction = { queued: true } as any;
+  } else {
+    extraction = await extractFromText(content);
+    isQueued = "queued" in extraction && extraction.queued === true;
+  }
 
   // 2. Create Episode (ground truth) — processed:false when extraction was deferred
+  // event_at = when this actually happened (may differ from ingestion time).
+  // Example: retaining "We met last Tuesday" on Friday → event_at = Tuesday, timestamp = Friday.
   const episodeId = await createNode("Episode", {
     content,
     source_type: toEpisodeSource(source),
     participants,
-    timestamp: now,
+    timestamp: now,          // ingestion time (always now)
+    event_at: eventAt ?? now, // event time (caller-supplied, defaults to ingestion time)
     processed: !isQueued,
   });
 
@@ -150,6 +170,9 @@ export async function retain(
 
     // Create fact-bearing edges (Graphiti pattern) if available
     if (extraction.facts && extraction.facts.length > 0) {
+      // Derive source authority from the retain() source type.
+      // Voice and direct manual input rank highest; LLM extraction is lower.
+      const authority = SOURCE_AUTHORITY[source] ?? DEFAULT_AUTHORITY;
       for (const fact of extraction.facts) {
         const fromId = entityIds[fact.from];
         const toId = entityIds[fact.to];
@@ -164,6 +187,8 @@ export async function retain(
             episodeId,
             validAt,
             invalidAt,
+            authority,
+            "asserted",
           );
         }
       }

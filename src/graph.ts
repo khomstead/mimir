@@ -97,6 +97,12 @@ export async function initGraph(dataPath: string): Promise<Graph> {
   await graph
     .query("CREATE INDEX FOR (ep:Episode) ON (ep.tenant_user_id, ep.timestamp)")
     .catch(() => {});
+  // Composite for temporal recall strategy — `as_of` filters on event_at
+  // (Pith bitemporal pattern). Without this, the tenant filter + event_at
+  // upper-bound require two index scans + a join.
+  await graph
+    .query("CREATE INDEX FOR (ep:Episode) ON (ep.tenant_user_id, ep.event_at)")
+    .catch(() => {});
   await graph
     .query("CREATE INDEX FOR (a:Anchor) ON (a.tenant_user_id, a.domain)")
     .catch(() => {});

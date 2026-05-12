@@ -1,14 +1,15 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { initGraph, closeGraph, createNode, getGraph } from "../graph.js";
 import { anchor } from "../verbs/anchor.js";
+import type { TenantStamp } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-anchor-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_anchor" };
 
 describe("anchor verb", () => {
   beforeAll(async () => {
     await initGraph(TEST_DATA_PATH);
 
-    // Create a domain entity for constrains edges
     await createNode("Entity", {
       name: "Education",
       type: "domain",
@@ -16,7 +17,7 @@ describe("anchor verb", () => {
       synonyms: ["education"],
       created_at: Date.now(),
       updated_at: Date.now(),
-    });
+    }, TEST_TENANT);
   });
 
   afterAll(async () => {
@@ -27,6 +28,7 @@ describe("anchor verb", () => {
     const result = await anchor(
       "Every child deserves to be seen and heard",
       "education",
+      TEST_TENANT,
     );
     expect(result.created).toBe(true);
     expect(result.anchor_id).toBeDefined();
@@ -49,19 +51,19 @@ describe("anchor verb", () => {
     const result = await anchor(
       "Learning happens through relationship, not curriculum alone",
       "education",
+      TEST_TENANT,
     );
     expect(result.constrained_entities.length).toBeGreaterThan(0);
     expect(result.constrained_entities).toContain("Education");
   });
 
   test("supersedes existing anchor in same domain", async () => {
-    // First anchor was created above. Create a new one in same domain.
     const result = await anchor(
       "Trust is the prerequisite for learning",
       "education",
+      TEST_TENANT,
     );
     expect(result.created).toBe(true);
-    // The previous anchors should be superseded
     expect(result.superseded.length).toBeGreaterThan(0);
     expect(result.superseded[0]).toHaveProperty("id");
     expect(result.superseded[0]).toHaveProperty("content");
@@ -69,7 +71,6 @@ describe("anchor verb", () => {
 
   test("superseded anchors have reduced weight", async () => {
     const g = getGraph();
-    // Check that old anchors got weight reduced to 0.1
     const result = await g.query(
       `MATCH (a:Anchor {domain: 'education'})
        WHERE a.weight = 0.1
@@ -80,7 +81,7 @@ describe("anchor verb", () => {
   });
 
   test("accepts custom weight", async () => {
-    const result = await anchor("Health enables everything", "health", 0.8);
+    const result = await anchor("Health enables everything", "health", TEST_TENANT, 0.8);
     expect(result.created).toBe(true);
 
     const g = getGraph();

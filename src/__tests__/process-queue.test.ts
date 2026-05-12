@@ -1,21 +1,22 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { initGraph, closeGraph, createNode, createEdge, getGraph } from "../graph.js";
 import { processQueue } from "../verbs/process-queue.js";
+import type { TenantStamp } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-queue-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_queue" };
 
 describe("processQueue", () => {
   beforeAll(async () => {
     await initGraph(TEST_DATA_PATH);
 
-    // Seed: unprocessed episode + linked thought
     const epId = await createNode("Episode", {
       content: "Kyle discussed the school project with Catherine",
       source_type: "conversation",
       participants: ["Kyle", "Catherine"],
       timestamp: Date.now(),
       processed: false,
-    });
+    }, TEST_TENANT);
 
     const tId = await createNode("Thought", {
       content: "Kyle discussed the school project with Catherine",
@@ -23,18 +24,17 @@ describe("processQueue", () => {
       source: "chat",
       confidence: 0,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
     await createEdge("Thought", tId, "Episode", epId, "extracted_from");
 
-    // Also seed a processed episode (should be skipped)
     await createNode("Episode", {
       content: "Already processed content",
       source_type: "conversation",
       participants: [],
       timestamp: Date.now(),
       processed: true,
-    });
+    }, TEST_TENANT);
   });
 
   afterAll(async () => {

@@ -1,14 +1,16 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { initGraph, closeGraph, createNode, createEdge } from "../graph.js";
 import { reflect } from "../verbs/reflect.js";
+import type { TenantStamp, TenantFilter } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-reflect-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_reflect" };
+const TEST_FILTER: TenantFilter = { callerUserId: "test_user_reflect" };
 
 describe("reflect verb", () => {
   beforeAll(async () => {
     await initGraph(TEST_DATA_PATH);
 
-    // Seed: entity + multiple thoughts + episode links
     const entityId = await createNode("Entity", {
       name: "Trust",
       type: "concept",
@@ -16,7 +18,7 @@ describe("reflect verb", () => {
       synonyms: [],
       created_at: Date.now(),
       updated_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
     const ep1 = await createNode("Episode", {
       content: "Discussed trust in the school",
@@ -24,7 +26,7 @@ describe("reflect verb", () => {
       participants: ["Kyle"],
       timestamp: Date.now(),
       processed: true,
-    });
+    }, TEST_TENANT);
 
     const t1 = await createNode("Thought", {
       content: "Trust is the foundation of everything we build",
@@ -32,7 +34,7 @@ describe("reflect verb", () => {
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
     const t2 = await createNode("Thought", {
       content: "Trust requires vulnerability and consistency",
@@ -40,23 +42,19 @@ describe("reflect verb", () => {
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
-    // Link thoughts to episode and entity
     await createEdge("Thought", t1, "Episode", ep1, "extracted_from");
     await createEdge("Episode", ep1, "Entity", entityId, "involves");
     await createEdge("Thought", t2, "Episode", ep1, "extracted_from");
-
-    // Create evolves chain
     await createEdge("Thought", t1, "Thought", t2, "evolves");
 
-    // Create an anchor with no recent activity to trigger gap detection
     await createNode("Anchor", {
       content: "Physical health enables everything else",
       domain: "health",
       weight: 1.0,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
   });
 
   afterAll(async () => {
@@ -64,7 +62,7 @@ describe("reflect verb", () => {
   });
 
   test("returns ReflectResponse structure", async () => {
-    const result = await reflect();
+    const result = await reflect(TEST_FILTER);
     expect(result).toHaveProperty("synthesis");
     expect(result).toHaveProperty("patterns");
     expect(result).toHaveProperty("gaps");
@@ -75,8 +73,7 @@ describe("reflect verb", () => {
   });
 
   test("detects patterns (entities in multiple thoughts)", async () => {
-    const result = await reflect();
-    // Trust entity appears in both thoughts via episode
+    const result = await reflect(TEST_FILTER);
     if (result.patterns.length > 0) {
       expect(result.patterns[0]).toHaveProperty("theme");
       expect(result.patterns[0]).toHaveProperty("frequency");
@@ -85,23 +82,20 @@ describe("reflect verb", () => {
   });
 
   test("detects evolving ideas", async () => {
-    const result = await reflect();
-    // We created an evolves chain
+    const result = await reflect(TEST_FILTER);
     expect(result.evolving_ideas.length).toBeGreaterThanOrEqual(1);
     expect(result.evolving_ideas[0]).toHaveProperty("chain");
     expect(result.evolving_ideas[0]).toHaveProperty("summary");
   });
 
   test("detects domain gaps", async () => {
-    const result = await reflect();
-    // "health" domain has an anchor but no thoughts mentioning "health"
+    const result = await reflect(TEST_FILTER);
     const healthGap = result.gaps.find((g) => g.domain === "health");
     expect(healthGap).toBeDefined();
   });
 
   test("scope filter narrows results", async () => {
-    const result = await reflect("trust");
-    // Only thoughts containing "trust" should be included
+    const result = await reflect(TEST_FILTER, "trust");
     expect(result.thoughts_analyzed).toBeGreaterThanOrEqual(1);
   });
 });

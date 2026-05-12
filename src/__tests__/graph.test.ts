@@ -1,5 +1,10 @@
 /**
  * Mimir — Graph Layer Tests
+ *
+ * Phase 1E: createNode / findEntityByName / vectorSearch all require a
+ * TenantStamp or TenantFilter. These tests use a single TEST_TENANT
+ * across all assertions; cross-tenant isolation is asserted in
+ * `tenant-isolation.test.ts`.
  */
 
 import { describe, it, expect, afterAll } from "bun:test";
@@ -12,8 +17,11 @@ import {
   findEntityByName,
   vectorSearch,
 } from "../graph.js";
+import type { TenantStamp, TenantFilter } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_graph" };
+const TEST_FILTER: TenantFilter = { callerUserId: "test_user_graph" };
 
 describe("graph", () => {
   afterAll(async () => {
@@ -23,7 +31,6 @@ describe("graph", () => {
   it("initializes graph and creates schema", async () => {
     const g = await initGraph(TEST_DATA_PATH);
     expect(g).toBeTruthy();
-    // getGraph should return the same instance
     expect(getGraph()).toBe(g);
   });
 
@@ -35,55 +42,46 @@ describe("graph", () => {
       synonyms: ["Kyle Homstead", "KH"],
       created_at: Date.now(),
       updated_at: Date.now(),
-    });
+    }, TEST_TENANT);
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
   });
 
   it("finds entity by name (case insensitive)", async () => {
-    const result = await findEntityByName("kyle");
+    const result = await findEntityByName("kyle", TEST_FILTER);
     expect(result).not.toBeNull();
     expect(result!.name).toBe("Kyle");
     expect(result!.type).toBe("person");
 
-    // Also find by synonym
-    const bySynonym = await findEntityByName("KH");
+    const bySynonym = await findEntityByName("KH", TEST_FILTER);
     expect(bySynonym).not.toBeNull();
     expect(bySynonym!.name).toBe("Kyle");
   });
 
   it("creates a Thought node", async () => {
-    // Generate a fake 1536-dim embedding
     const embedding = Array.from({ length: 1536 }, () => Math.random());
-
     const id = await createNode("Thought", {
       content: "The brain MCP server should use FalkorDBLite for persistence",
       embedding,
       source: "chat",
       confidence: 0.9,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
   });
 
   it("creates an edge between Entity and Thought", async () => {
-    // Get the entity and thought IDs via Cypher
     const g = getGraph();
-
     const entityResult = await g.query(
       "MATCH (e:Entity {name: 'Kyle'}) RETURN e.id AS id LIMIT 1"
     );
     const entityId = (entityResult.data![0] as Record<string, unknown>).id as string;
-
     const thoughtResult = await g.query(
       "MATCH (t:Thought) RETURN t.id AS id LIMIT 1"
     );
     const thoughtId = (thoughtResult.data![0] as Record<string, unknown>).id as string;
-
     await createEdge("Entity", entityId, "Thought", thoughtId, "authored_by");
-
-    // Verify the edge exists
     const edgeResult = await g.query(
       `MATCH (e:Entity {id: $entityId})-[r:authored_by]->(t:Thought {id: $thoughtId})
        RETURN r.type AS type, r.confidence AS confidence`,
@@ -97,8 +95,6 @@ describe("graph", () => {
   });
 
   it("vectorSearch returns similar thoughts ranked by score", async () => {
-    // Create two thoughts with known embeddings:
-    // "close" is a unit vector in dim 0, "far" is a unit vector in dim 500
     const closeEmbedding = Array.from({ length: 1536 }, (_, i) => (i === 0 ? 1.0 : 0.0));
     const farEmbedding = Array.from({ length: 1536 }, (_, i) => (i === 500 ? 1.0 : 0.0));
 
@@ -108,26 +104,23 @@ describe("graph", () => {
       source: "chat",
       confidence: 0.9,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
     await createNode("Thought", {
       content: "Far thought about routing",
       embedding: farEmbedding,
       source: "chat",
       confidence: 0.9,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
-    // Query with a vector similar to closeEmbedding (dim 0 dominant)
     const queryVec = Array.from({ length: 1536 }, (_, i) => (i === 0 ? 0.9 : 0.05));
-    const results = await vectorSearch(queryVec, 5);
+    const results = await vectorSearch(queryVec, 5, TEST_FILTER);
 
     expect(results.length).toBeGreaterThanOrEqual(2);
-    // "Close thought" should have a higher score than "Far thought"
     const closeResult = results.find((r) => r.content.includes("Close thought"));
     const farResult = results.find((r) => r.content.includes("Far thought"));
     expect(closeResult).toBeDefined();
     expect(farResult).toBeDefined();
-    // FalkorDB cosine returns distance (lower = more similar)
     expect(closeResult!.score).toBeLessThan(farResult!.score);
   });
 
@@ -137,11 +130,10 @@ describe("graph", () => {
       domain: "operating_principles",
       weight: 1.0,
       created_at: Date.now(),
-    });
+    }, TEST_TENANT);
     expect(typeof id).toBe("string");
     expect(id.length).toBeGreaterThan(0);
 
-    // Verify via Cypher
     const g = getGraph();
     const result = await g.query(
       "MATCH (a:Anchor {id: $id}) RETURN a.content AS content, a.domain AS domain",

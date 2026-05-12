@@ -1,8 +1,11 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { initGraph, closeGraph, createNode, getGraph } from "../graph.js";
 import { connect } from "../verbs/connect.js";
+import type { TenantStamp, TenantFilter } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-connect-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_connect" };
+const TEST_FILTER: TenantFilter = { callerUserId: "test_user_connect" };
 
 describe("connect verb", () => {
   let entity1Id: string;
@@ -18,7 +21,7 @@ describe("connect verb", () => {
       synonyms: ["kyle_homstead"],
       created_at: Date.now(),
       updated_at: Date.now(),
-    });
+    }, TEST_TENANT);
 
     entity2Id = await createNode("Entity", {
       name: "School Project",
@@ -27,7 +30,7 @@ describe("connect verb", () => {
       synonyms: ["school_project"],
       created_at: Date.now(),
       updated_at: Date.now(),
-    });
+    }, TEST_TENANT);
   });
 
   afterAll(async () => {
@@ -35,7 +38,7 @@ describe("connect verb", () => {
   });
 
   test("connects two entities by name", async () => {
-    const result = await connect("Kyle", "School Project", "Kyle leads the school project");
+    const result = await connect("Kyle", "School Project", TEST_FILTER, "Kyle leads the school project");
     expect(result.connected).toBe(true);
     expect(result.source_id).toBe(entity1Id);
     expect(result.target_id).toBe(entity2Id);
@@ -44,7 +47,7 @@ describe("connect verb", () => {
   });
 
   test("creates edge with specified type", async () => {
-    const result = await connect("Kyle", "School Project", "Kyle contributes to it", "contributes_to");
+    const result = await connect("Kyle", "School Project", TEST_FILTER, "Kyle contributes to it", "contributes_to");
     expect(result.edge_type).toBe("contributes_to");
   });
 
@@ -60,19 +63,19 @@ describe("connect verb", () => {
   });
 
   test("connects by node ID", async () => {
-    const result = await connect(entity1Id, entity2Id, "ID-based connection");
+    const result = await connect(entity1Id, entity2Id, TEST_FILTER, "ID-based connection");
     expect(result.connected).toBe(true);
   });
 
   test("throws for unknown source", async () => {
     expect(
-      connect("NonexistentEntity123", "Kyle", "test"),
+      connect("NonexistentEntity123", "Kyle", TEST_FILTER, "test"),
     ).rejects.toThrow(/Source not found/);
   });
 
   test("throws for unknown target", async () => {
     expect(
-      connect("Kyle", "NonexistentEntity456", "test"),
+      connect("Kyle", "NonexistentEntity456", TEST_FILTER, "test"),
     ).rejects.toThrow(/Target not found/);
   });
 });

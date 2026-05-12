@@ -7,8 +7,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { initGraph, closeGraph, getGraph } from "../graph.js";
 import { retain } from "../verbs/retain.js";
+import type { TenantStamp } from "../types.js";
 
 const TEST_DATA_PATH = `/tmp/mimir-retain-test-${Date.now()}`;
+const TEST_TENANT: TenantStamp = { userId: "test_user_retain" };
 
 describe("retain verb", () => {
   beforeAll(async () => {
@@ -23,6 +25,9 @@ describe("retain verb", () => {
     const result = await retain(
       "Trust is the foundation of the school project",
       "chat",
+      [],
+      undefined,
+      TEST_TENANT,
     );
     expect(result.stored).toBe(true);
     expect(result.thought_id).toBeDefined();
@@ -44,6 +49,10 @@ describe("retain verb", () => {
   test("returns valid RetainResponse structure", async () => {
     const result = await retain(
       "Kyle met with Catherine about curriculum",
+      "manual",
+      [],
+      undefined,
+      TEST_TENANT,
     );
     expect(result).toHaveProperty("stored");
     expect(result).toHaveProperty("thought_id");

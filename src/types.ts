@@ -5,6 +5,78 @@
  * for the temporal knowledge graph.
  */
 
+// ─── Multi-tenancy (Phase 1E) ────────────────────────────────
+
+/**
+ * Identifies which user (and optionally which org + folio context) owns
+ * a piece of knowledge in the graph. Every Episode, Thought, Entity,
+ * and Anchor is stamped with a TenantStamp at creation time. Recall
+ * queries are scoped to a caller's stamp at the Cypher WHERE-clause
+ * level — never post-filter, never default to a fallback user.
+ *
+ * Required: `userId` — the Convex `users` _id of the owner. A missing
+ * userId on a request rejects at the API layer (401, when require gate
+ * is enabled), and on a graph write throws (refusing the write).
+ *
+ * Optional:
+ *   - `organizationId`: when present, scopes the node to this org. Used
+ *     by recall to filter by `mosscap_sessions.activeOrgScope`. Null on
+ *     legacy single-tenant data and on personal-only nodes.
+ *   - `folioIds`: array of folio IDs this content references. Used by
+ *     the share-revocation forget cascade — when a share to folioX is
+ *     revoked, nodes the recipient retained that reference folioX get
+ *     `tenant_invisible_after = now`.
+ *
+ * Backfill: existing nodes get `userId = GOBOT_DEFAULT_USER_ID` (Kyle)
+ * via `scripts/migrate-add-tenant.ts`. `organizationId` and `folioIds`
+ * remain unset on legacy nodes and are treated as "no scope filter."
+ */
+export interface TenantStamp {
+  /** Convex `users` _id of the node owner. Required on every write. */
+  userId: string;
+  /** Optional org-scope context (Convex `organizations` _id). */
+  organizationId?: string;
+  /** Optional folio context (array of Convex `mosscap_folios` _ids). */
+  folioIds?: string[];
+}
+
+/**
+ * Tenant filter for recall queries. Filters use the caller's userId as
+ * the leftmost predicate of every Cypher query — content owned by other
+ * users is structurally invisible unless one of the visibility relaxations
+ * is set:
+ *
+ *   - `includeFolioIds`: include nodes whose `folio_ids` array contains
+ *     any of these IDs. Used when the caller has access to folios shared
+ *     by other users (Phase 1D `folio_members`).
+ *   - `activeOrgScope`: when set, additionally filter to nodes whose
+ *     `tenant_org_id` matches OR is null (legacy untagged content).
+ *     Implements the audit's "recall scoped by activeOrgScope" req.
+ *
+ * A query with NO callerUserId is REJECTED at the API layer (when the
+ * require-tenant-header gate is on). The `TenantFilter` shape never
+ * permits an empty/anonymous caller — that's the structural defense
+ * against confused-deputy cross-tenant leaks.
+ *
+ * The Phase 1E sharing-semantics model is READ-PREDICATE (not clone):
+ * Episodes and Thoughts live in their retainer's tenant and are
+ * surfaced cross-boundary via `folio_ids` ∩ `includeFolioIds`. Entities
+ * and fact-edges remain strictly per-tenant (every user gets their own
+ * "Kyle Homstead" entity). At share-revoke, the caller's
+ * `includeFolioIds` shrinks → cross-tenant reads stop instantly; in
+ * parallel the forget cascade marks the recipient's OWN derived
+ * Episodes (those they retained with folio_ids: [revokedFolioId])
+ * invisible via `tenant_invisible_after`.
+ */
+export interface TenantFilter {
+  /** Caller's userId — required. */
+  callerUserId: string;
+  /** Folios the caller has access to (own + shared). May be empty. */
+  includeFolioIds?: string[];
+  /** Active org scope from `mosscap_sessions.activeOrgScope`. Null = no org filter. */
+  activeOrgScope?: string;
+}
+
 // ─── Node Types ──────────────────────────────────────────────
 
 export type EntityType = "person" | "org" | "project" | "concept" | "domain";
@@ -18,6 +90,15 @@ export interface EntityNode {
   synonyms: string[];
   created_at: number;
   updated_at: number;
+  // ─── Phase 1E multi-tenancy ─────────────────────────────────
+  /** Convex `users` _id of the entity owner. Required post-Phase-1E. */
+  tenant_user_id: string;
+  /** Optional org-scope context. */
+  tenant_org_id?: string;
+  /** Optional folio refs (array). Used for share-revocation forget cascade. */
+  folio_ids?: string[];
+  /** Phase 1E forget-cascade marker: epoch ms after which this node is invisible to its owner. */
+  tenant_invisible_after?: number;
 }
 
 export type ThoughtSource =
@@ -35,6 +116,11 @@ export interface ThoughtNode {
   source: ThoughtSource;
   confidence: number;
   created_at: number;
+  // ─── Phase 1E multi-tenancy ─────────────────────────────────
+  tenant_user_id: string;
+  tenant_org_id?: string;
+  folio_ids?: string[];
+  tenant_invisible_after?: number;
 }
 
 export interface AnchorNode {
@@ -43,6 +129,11 @@ export interface AnchorNode {
   domain: string;
   weight: number;
   created_at: number;
+  // ─── Phase 1E multi-tenancy ─────────────────────────────────
+  tenant_user_id: string;
+  tenant_org_id?: string;
+  folio_ids?: string[];
+  tenant_invisible_after?: number;
 }
 
 export type EpisodeSourceType =
@@ -58,7 +149,14 @@ export interface EpisodeNode {
   source_type: EpisodeSourceType;
   participants: string[];
   timestamp: number;
+  /** Event time (when the content actually happened). May differ from ingestion `timestamp`. */
+  event_at?: number;
   processed: boolean;
+  // ─── Phase 1E multi-tenancy ─────────────────────────────────
+  tenant_user_id: string;
+  tenant_org_id?: string;
+  folio_ids?: string[];
+  tenant_invisible_after?: number;
 }
 
 export interface MeetingNode {

@@ -11,7 +11,7 @@
  * Usage: bun run src/service.ts
  */
 
-import { initGraph, closeGraph, getGraph, findEntityByName, vectorSearch, hydrateNode } from "./graph.js";
+import { initGraph, closeGraph, getGraph, findEntityByName, vectorSearch, hydrateNode, applyTenantFilter } from "./graph.js";
 import { retain } from "./verbs/retain.js";
 import { recall } from "./verbs/recall.js";
 import { pulse } from "./verbs/pulse.js";
@@ -20,7 +20,8 @@ import { connect } from "./verbs/connect.js";
 import { anchor } from "./verbs/anchor.js";
 import { triage } from "./verbs/triage.js";
 import { processQueue } from "./verbs/process-queue.js";
-import { forget } from "./verbs/forget.js";
+import { forget, forgetByShareRevocation } from "./verbs/forget.js";
+import type { TenantStamp, TenantFilter } from "./types.js";
 
 const DATA_PATH =
   process.env.MIMIR_DATA_PATH || "/Volumes/AI-Lab/falkordb-data/personal-brain";
@@ -44,6 +45,26 @@ if (REQUIRE_AUTH && !SHARED_SECRET) {
     "[mimir] MIMIR_REQUIRE_AUTH is true but MIMIR_SHARED_SECRET is empty. " +
     "All non-/health requests will be rejected. " +
     "Set MIMIR_SHARED_SECRET in the launchd plist or unset MIMIR_REQUIRE_AUTH for local-only deployments.",
+  );
+}
+
+// Phase 1E: tenant-header cutover gate.
+// When true: missing X-Mimir-User-Id → 401 (fail-closed).
+// When false (Phase 1E cutover window): missing header logs a warning and
+// defaults to GOBOT_DEFAULT_USER_ID. Lets gobot+Mimir deploys land
+// non-atomically (gobot ships header-passing → 24h verification → flip
+// this env to true). Defaults to FALSE for backward-compat on the
+// initial deploy; flip via launchd plist update.
+const REQUIRE_TENANT_HEADER =
+  (process.env.MIMIR_REQUIRE_TENANT_HEADER ?? "false").toLowerCase() === "true";
+const DEFAULT_TENANT_FALLBACK_USER_ID =
+  process.env.GOBOT_DEFAULT_USER_ID ?? "";
+if (!REQUIRE_TENANT_HEADER && !DEFAULT_TENANT_FALLBACK_USER_ID) {
+  console.error(
+    "[mimir] MIMIR_REQUIRE_TENANT_HEADER=false AND GOBOT_DEFAULT_USER_ID empty. " +
+    "Tenant-stamped writes from clients lacking X-Mimir-User-Id will fail. " +
+    "Set GOBOT_DEFAULT_USER_ID to Kyle's userId for the cutover window, " +
+    "or flip MIMIR_REQUIRE_TENANT_HEADER=true once gobot ships header-passing.",
   );
 }
 
@@ -77,6 +98,109 @@ function requireBearer(req: Request, path: string): Response | null {
   return null;
 }
 
+// ─── Phase 1E: Tenant header parsing ────────────────────────
+
+/**
+ * Parse Phase 1E tenant headers from a request.
+ *
+ *   X-Mimir-User-Id        Convex `users` _id of the caller (required)
+ *   X-Mimir-Active-Org     Convex `organizations` _id (optional)
+ *   X-Mimir-Folio-Ids      comma-separated `mosscap_folios` _ids (optional)
+ *
+ * Returns null if missing (caller path must decide whether to 401 or
+ * fallback). Header parsing only — no validation against Convex; the
+ * service trusts the gobot daemon (gated by Bearer auth) to send
+ * legitimate IDs.
+ */
+function parseTenantHeaders(req: Request): {
+  userId: string | null;
+  activeOrgScope: string | undefined;
+  folioIds: string[];
+} {
+  const userId = req.headers.get("x-mimir-user-id") || null;
+  const activeOrgScope = req.headers.get("x-mimir-active-org") || undefined;
+  const folioHeader = req.headers.get("x-mimir-folio-ids") || "";
+  const folioIds = folioHeader
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return { userId, activeOrgScope, folioIds };
+}
+
+/**
+ * Phase 1E: extract a TenantStamp for write paths (retain, anchor, etc.).
+ * Returns a 401 Response if no userId is present AND the require gate is on.
+ * Returns the TenantStamp if either the header is present, or the
+ * fallback is enabled and a default userId exists.
+ */
+function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Response } {
+  const { userId, activeOrgScope, folioIds } = parseTenantHeaders(req);
+
+  if (userId) {
+    return {
+      stamp: {
+        userId,
+        organizationId: activeOrgScope,
+        folioIds: folioIds.length > 0 ? folioIds : undefined,
+      },
+    };
+  }
+
+  // No userId header — apply cutover fallback if allowed.
+  if (REQUIRE_TENANT_HEADER) {
+    return {
+      denied: jsonResponse(
+        {
+          error:
+            "Missing X-Mimir-User-Id header (Phase 1E tenant gate enforced). " +
+            "Every write must identify the caller's userId.",
+        },
+        401,
+      ),
+    };
+  }
+  if (!DEFAULT_TENANT_FALLBACK_USER_ID) {
+    return {
+      denied: jsonResponse(
+        {
+          error:
+            "Missing X-Mimir-User-Id header and no GOBOT_DEFAULT_USER_ID fallback configured.",
+        },
+        401,
+      ),
+    };
+  }
+  // Cutover-window fallback: log once-per-request and use default user.
+  console.error(
+    `[mimir:tenant-gate] CUTOVER WARN: ${req.method} ${new URL(req.url).pathname} ` +
+    `missing X-Mimir-User-Id — falling back to GOBOT_DEFAULT_USER_ID. ` +
+    `Flip MIMIR_REQUIRE_TENANT_HEADER=true once gobot ships header-passing.`,
+  );
+  return {
+    stamp: {
+      userId: DEFAULT_TENANT_FALLBACK_USER_ID,
+      organizationId: activeOrgScope,
+      folioIds: folioIds.length > 0 ? folioIds : undefined,
+    },
+  };
+}
+
+/**
+ * Phase 1E: extract a TenantFilter for read paths (recall, pulse, etc.).
+ * Same cutover semantics as extractTenantStamp.
+ */
+function extractTenantFilter(req: Request): { filter: TenantFilter } | { denied: Response } {
+  const r = extractTenantStamp(req);
+  if ("denied" in r) return { denied: r.denied };
+  return {
+    filter: {
+      callerUserId: r.stamp.userId,
+      activeOrgScope: r.stamp.organizationId,
+      includeFolioIds: r.stamp.folioIds,
+    },
+  };
+}
+
 // ─── HTTP Server ───────────────────────────────────────────
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -108,6 +232,8 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/recall" && req.method === "GET") {
     const query = url.searchParams.get("q");
     if (!query) return errorResponse("Missing ?q= parameter");
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
     const scope = url.searchParams.get("scope") || undefined;
     const from = url.searchParams.get("from");
     const to = url.searchParams.get("to");
@@ -119,7 +245,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const asOf = asOfRaw ? parseInt(asOfRaw) : undefined;
     const validIntents = new Set(["when", "who", "why", "what", "how"]);
     const intent = intentRaw && validIntents.has(intentRaw) ? intentRaw as any : undefined;
-    const result = await recall(query, scope, timeRange, asOf, intent);
+    const result = await recall(query, filterResult.filter, scope, timeRange, asOf, intent);
     return jsonResponse(result);
   }
 
@@ -127,6 +253,8 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/retain" && req.method === "POST") {
     const body = await req.json();
     if (!body.content) return errorResponse("Missing content field");
+    const stampResult = extractTenantStamp(req);
+    if ("denied" in stampResult) return stampResult.denied;
     // event_at: accept ISO 8601 string or Unix ms integer
     let eventAt: number | undefined;
     if (body.event_at !== undefined) {
@@ -134,7 +262,13 @@ async function handleRequest(req: Request): Promise<Response> {
         ? new Date(body.event_at).getTime()
         : body.event_at;
     }
-    const result = await retain(body.content, body.source || "manual", body.participants || [], eventAt);
+    const result = await retain(
+      body.content,
+      body.source || "manual",
+      body.participants || [],
+      eventAt,
+      stampResult.stamp,
+    );
     return jsonResponse(result);
   }
 
@@ -142,19 +276,23 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/pulse" && req.method === "GET") {
     const entity = url.searchParams.get("entity");
     if (!entity) return errorResponse("Missing ?entity= parameter");
-    const result = await pulse(entity);
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const result = await pulse(entity, filterResult.filter);
     return jsonResponse(result);
   }
 
   // ── Reflect (GET /api/reflect?scope=...&from=...&to=...) ──
   if (path === "/api/reflect" && req.method === "GET") {
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
     const scope = url.searchParams.get("scope") || undefined;
     const from = url.searchParams.get("from");
     const to = url.searchParams.get("to");
     const timeRange = from || to
       ? { from: from ? parseInt(from) : undefined, to: to ? parseInt(to) : undefined }
       : undefined;
-    const result = await reflect(scope, timeRange);
+    const result = await reflect(filterResult.filter, scope, timeRange);
     return jsonResponse(result);
   }
 
@@ -162,7 +300,15 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/connect" && req.method === "POST") {
     const body = await req.json();
     if (!body.source || !body.target) return errorResponse("Missing source or target");
-    const result = await connect(body.source, body.target, body.rationale, body.edge_type);
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const result = await connect(
+      body.source,
+      body.target,
+      filterResult.filter,
+      body.rationale,
+      body.edge_type,
+    );
     return jsonResponse(result);
   }
 
@@ -170,7 +316,9 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/anchor" && req.method === "POST") {
     const body = await req.json();
     if (!body.content || !body.domain) return errorResponse("Missing content or domain");
-    const result = await anchor(body.content, body.domain, body.weight);
+    const stampResult = extractTenantStamp(req);
+    if ("denied" in stampResult) return stampResult.denied;
+    const result = await anchor(body.content, body.domain, stampResult.stamp, body.weight);
     return jsonResponse(result);
   }
 
@@ -178,11 +326,16 @@ async function handleRequest(req: Request): Promise<Response> {
   if (path === "/api/triage" && req.method === "POST") {
     const body = await req.json();
     if (!body.content || !body.source) return errorResponse("Missing content or source");
-    const result = await triage(body.content, body.source, body.source_type);
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const result = await triage(body.content, body.source, filterResult.filter, body.source_type);
     return jsonResponse(result);
   }
 
   // ── Process Queue (POST /api/process-queue) ──
+  // Note: process-queue reads tenant from each Episode it processes — no
+  // header required. This endpoint is a privileged operation (Bearer-auth
+  // gates it).
   if (path === "/api/process-queue" && req.method === "POST") {
     const body = await req.json().catch(() => ({}));
     const result = await processQueue(body.limit || 20);
@@ -193,12 +346,44 @@ async function handleRequest(req: Request): Promise<Response> {
   // Retract knowledge about an entity or episode. Marks entity summaries as
   // [RETRACTED] and sets all derived fact edges to belief_state='retracted'.
   // Source Episodes and Thoughts are preserved as immutable ground truth.
+  // Phase 1E: tenant-scoped — caller can only retract their own entities.
   if (path === "/api/forget" && req.method === "POST") {
     const body = await req.json();
     if (!body.entity && !body.episode_id) {
       return errorResponse("Missing 'entity' (name) or 'episode_id'");
     }
-    const result = await forget(body.entity || null, body.reason, body.episode_id);
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const result = await forget(
+      body.entity || null,
+      filterResult.filter,
+      body.reason,
+      body.episode_id,
+    );
+    return jsonResponse(result);
+  }
+
+  // ── Forget Cascade (POST /api/forget-cascade) ──
+  // Phase 1E share-revocation cascade. Marks the revoked user's OWN
+  // Episodes/Thoughts/Entities that reference the revoked folio via
+  // `folio_ids` as `tenant_invisible_after = now`. The sharer's view
+  // is UNTOUCHED — Episode = ground truth, never modified.
+  //
+  // Privileged endpoint: NOT caller-tenant-filtered. The Bearer-auth
+  // gate ensures only the gobot daemon (holding MIMIR_SHARED_SECRET)
+  // can invoke this. Triggered via Convex action from
+  // folioMembers.removeMember.
+  if (path === "/api/forget-cascade" && req.method === "POST") {
+    const body = await req.json();
+    if (!body.folio_id || !body.revoked_user_id) {
+      return errorResponse(
+        "Missing required fields: folio_id, revoked_user_id (Phase 1E cascade contract)",
+      );
+    }
+    const result = await forgetByShareRevocation({
+      folioId: body.folio_id,
+      revokedUserId: body.revoked_user_id,
+    });
     return jsonResponse(result);
   }
 
@@ -217,6 +402,15 @@ async function handleRequest(req: Request): Promise<Response> {
     const query = url.searchParams.get("q");
     if (!query) return errorResponse("Missing ?q= parameter");
 
+    // Phase 1E: /api/context is the prompt-injection entry point used by
+    // gobot. Tenant scope is required so cross-tenant content never leaks
+    // into Claude's prompt — that would break the "Provenance Always
+    // Named" Design Constitution principle AND the 2026-04-12
+    // fabrication-class incident's structural defense.
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const filter = filterResult.filter;
+
     const asOfRaw = url.searchParams.get("as_of");
     const asOf = asOfRaw ? parseInt(asOfRaw) : undefined;
 
@@ -225,21 +419,26 @@ async function handleRequest(req: Request): Promise<Response> {
     const seenEpisodes = new Set<string>(); // Dedupe by episode content prefix
 
     // ── Phase 1: Find Thoughts matching query, hydrate to source Episodes ──
+    // Phase 1E: tenant-scoped Thought + Episode matches.
     // as_of: filter Episodes by event_at so we only see content from before the cutoff.
     const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
     const thoughtSections: string[] = [];
     for (const word of words.slice(0, 3)) {
-      // as_of filters Thought by ingestion time (created_at), matching recall.ts semantics
+      const { fragment: tFrag, params: tParams } = applyTenantFilter("t", filter, "tt");
+      const { fragment: epFrag, params: epParams } = applyTenantFilter("ep", filter, "tep");
       const asOfFilter = asOf !== undefined ? " AND t.created_at <= $asOf" : "";
-      const asOfParams = asOf !== undefined ? { q: word, asOf } : { q: word };
+      const params: Record<string, unknown> = { q: word, ...tParams, ...epParams };
+      if (asOf !== undefined) params.asOf = asOf;
       const r = await g.query(
         `MATCH (t:Thought)
-         WHERE toLower(t.content) CONTAINS toLower($q)${asOfFilter}
+         WHERE toLower(t.content) CONTAINS toLower($q)
+           AND ${tFrag}${asOfFilter}
          OPTIONAL MATCH (t)-[:extracted_from]->(ep:Episode)
+         WHERE ${epFrag}
          RETURN t.content AS thought, t.created_at AS ts,
                 ep.content AS episode, ep.source_type AS source
          ORDER BY t.created_at DESC LIMIT 3`,
-        { params: asOfParams },
+        { params },
       );
       if (r.data) {
         for (const row of r.data as Record<string, unknown>[]) {
@@ -272,14 +471,16 @@ async function handleRequest(req: Request): Promise<Response> {
     const entitySections: string[] = [];
     const seenEntityNames = new Set<string>();
     for (const word of words.slice(0, 5)) {
+      const { fragment: eFrag, params: eParams } = applyTenantFilter("e", filter, "te");
       const r = await g.query(
         `MATCH (e:Entity)
          WHERE toLower(e.name) CONTAINS toLower($w)
            AND NOT e.summary STARTS WITH '[INVALIDATED]'
            AND NOT e.summary STARTS WITH '[RETRACTED]'
+           AND ${eFrag}
          RETURN e.id AS id, e.name AS name, e.type AS type, e.summary AS summary
          LIMIT 3`,
-        { params: { w: word } },
+        { params: { w: word, ...eParams } },
       );
       if (r.data) {
         for (const row of r.data as Record<string, unknown>[]) {
@@ -288,8 +489,8 @@ async function handleRequest(req: Request): Promise<Response> {
           if (seenEntityNames.has(name)) continue;
           seenEntityNames.add(name);
 
-          // Hydrate: fetch source episode for this entity
-          const hydrated = await hydrateNode(id, "Entity");
+          // Hydrate: fetch source episode for this entity (tenant-scoped).
+          const hydrated = await hydrateNode(id, "Entity", filter);
           if (hydrated && !seenEpisodes.has(hydrated.content.slice(0, 80))) {
             seenEpisodes.add(hydrated.content.slice(0, 80));
             const content = hydrated.content.length > MAX_EPISODE_CHARS
@@ -322,16 +523,22 @@ async function handleRequest(req: Request): Promise<Response> {
         const factParams: Record<string, unknown> = { name };
         if (asOf !== undefined) factParams.asOf = asOf;
 
+        // Phase 1E: fact-edge tenant scope. The edge itself is stamped
+        // with tenant_user_id; both endpoint entities must also be in
+        // the caller's tenant.
         const factResult = await g.query(
           `MATCH (a:Entity)-[r]->(b:Entity)
            WHERE (toLower(a.name) = toLower($name) OR toLower(b.name) = toLower($name))
              AND r.valid_until IS NULL
              AND r.fact IS NOT NULL
-             AND r.belief_state IN ['confirmed', 'asserted']${asOfFactFilter}
+             AND r.belief_state IN ['confirmed', 'asserted']
+             AND r.tenant_user_id = $callerUserId
+             AND a.tenant_user_id = $callerUserId
+             AND b.tenant_user_id = $callerUserId${asOfFactFilter}
            RETURN a.name AS from_name, b.name AS to_name, r.fact AS fact,
                   r.belief_state AS state, r.source_authority AS authority
            ORDER BY r.source_authority DESC LIMIT 3`,
-          { params: factParams },
+          { params: { ...factParams, callerUserId: filter.callerUserId } },
         );
         if (factResult.data) {
           for (const row of factResult.data as Record<string, unknown>[]) {
@@ -343,9 +550,13 @@ async function handleRequest(req: Request): Promise<Response> {
       }
     }
 
-    // ── Phase 3: Active anchors ──
+    // ── Phase 3: Active anchors (caller's tenant only) ──
     const anchorsResult = await g.query(
-      `MATCH (a:Anchor) WHERE a.weight > 0 RETURN a.content AS c, a.domain AS d LIMIT 5`,
+      `MATCH (a:Anchor)
+       WHERE a.weight > 0
+         AND a.tenant_user_id = $callerUserId
+       RETURN a.content AS c, a.domain AS d LIMIT 5`,
+      { params: { callerUserId: filter.callerUserId } },
     );
 
     // ── Build output ──
@@ -395,14 +606,21 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // ── Entities for triage (GET /api/entities) ──
+  // Phase 1E: tenant-scoped — each caller sees only their own person/org/
+  // project entities. Triage context from another user's graph would leak
+  // their relationship network.
   if (path === "/api/entities" && req.method === "GET") {
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
     const g = getGraph();
     const r = await g.query(
       `MATCH (e:Entity)
        WHERE e.type IN ['person', 'org', 'project']
+         AND e.tenant_user_id = $callerUserId
        RETURN e.name AS name, e.type AS type
        ORDER BY e.type, e.name
        LIMIT 50`,
+      { params: { callerUserId: filterResult.filter.callerUserId } },
     );
     if (!r.data || r.data.length === 0) {
       return new Response("", { headers: { "Content-Type": "text/plain" } });
@@ -452,6 +670,11 @@ async function main() {
   console.log("  POST /api/anchor");
   console.log("  POST /api/triage");
   console.log("  POST /api/process-queue");
+  console.log("  POST /api/forget");
+  console.log("  POST /api/forget-cascade  (Phase 1E share-revocation)");
+  console.log(
+    `[mimir:phase-1e] tenant-header gate: ${REQUIRE_TENANT_HEADER ? "ENFORCED (fail-closed)" : "CUTOVER WINDOW (fallback to GOBOT_DEFAULT_USER_ID)"}`,
+  );
 
   // ── Consolidation worker (dual-stream slow path) ────────────────────────
   // Automatically processes Episodes deferred by retain() in MIMIR_FAST_RETAIN

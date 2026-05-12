@@ -9,9 +9,9 @@
  * 5. Returns ranked RecallResponse
  */
 
-import { getGraph, vectorSearch, hydrateNode } from "../graph.js";
+import { getGraph, vectorSearch, hydrateNode, applyTenantFilter } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
-import type { RecallResult, RecallResponse } from "../types.js";
+import type { RecallResult, RecallResponse, TenantFilter } from "../types.js";
 
 interface TimeRange {
   from?: number;
@@ -33,15 +33,16 @@ interface IntermediateResult {
 }
 
 /**
- * Strategy 1: Semantic vector search.
+ * Strategy 1: Semantic vector search — tenant-scoped (Phase 1E).
  * Generate an embedding for the query and find similar Thoughts.
  */
 async function semanticSearch(
   query: string,
+  filter: TenantFilter,
 ): Promise<IntermediateResult[]> {
   try {
     const queryEmbedding = await generateEmbedding(query);
-    const results = await vectorSearch(queryEmbedding, 10);
+    const results = await vectorSearch(queryEmbedding, 10, filter);
 
     return results.map((r) => ({
       id: r.id,
@@ -70,14 +71,22 @@ async function semanticSearch(
  */
 async function graphSearch(
   query: string,
+  filter: TenantFilter,
   timeRange?: TimeRange,
   asOf?: number,
 ): Promise<IntermediateResult[]> {
   try {
     const g = getGraph();
 
+    const { fragment: tenantFragment, params: tenantParams } = applyTenantFilter(
+      "t",
+      filter,
+    );
     let timeFilter = "";
-    const params: Record<string, unknown> = { query: query.toLowerCase() };
+    const params: Record<string, unknown> = {
+      query: query.toLowerCase(),
+      ...tenantParams,
+    };
 
     if (timeRange?.from !== undefined) {
       timeFilter += " AND t.created_at >= $from";
@@ -95,7 +104,8 @@ async function graphSearch(
 
     const result = await g.query(
       `MATCH (t:Thought)
-       WHERE toLower(t.content) CONTAINS $query${timeFilter}
+       WHERE toLower(t.content) CONTAINS $query
+         AND ${tenantFragment}${timeFilter}
        OPTIONAL MATCH (t)-[]->(e:Entity)
        RETURN t.id AS id, t.content AS content, t.created_at AS created_at,
               collect(DISTINCT e.name) AS entity_names`,
@@ -130,22 +140,31 @@ async function graphSearch(
  */
 async function temporalSearch(
   query: string,
+  filter: TenantFilter,
   asOf?: number,
 ): Promise<IntermediateResult[]> {
   try {
     const g = getGraph();
 
-    const params: Record<string, unknown> = { query: query.toLowerCase() };
+    const { fragment: tenantFragment, params: tenantParams } = applyTenantFilter(
+      "ep",
+      filter,
+    );
+    const params: Record<string, unknown> = {
+      query: query.toLowerCase(),
+      ...tenantParams,
+    };
     let asOfFilter = "";
     if (asOf !== undefined) {
       asOfFilter = " AND ep.event_at <= $asOf";
       params.asOf = asOf;
     }
 
-    // Find Episodes whose content matches the query, filtered by event_at
+    // Find Episodes whose content matches the query, filtered by event_at AND tenant.
     const result = await g.query(
       `MATCH (ep:Episode)
-       WHERE toLower(ep.content) CONTAINS $query${asOfFilter}
+       WHERE toLower(ep.content) CONTAINS $query
+         AND ${tenantFragment}${asOfFilter}
        OPTIONAL MATCH (t:Thought)-[:extracted_from]->(ep)
        RETURN ep.id AS ep_id, ep.content AS ep_content,
               ep.event_at AS event_at, ep.timestamp AS ingested_at,
@@ -186,14 +205,22 @@ async function temporalSearch(
  */
 async function anchorSearch(
   query: string,
+  filter: TenantFilter,
   timeRange?: TimeRange,
   asOf?: number,
 ): Promise<IntermediateResult[]> {
   try {
     const g = getGraph();
 
+    const { fragment: tenantFragment, params: tenantParams } = applyTenantFilter(
+      "a",
+      filter,
+    );
     let timeFilter = "";
-    const params: Record<string, unknown> = { query: query.toLowerCase() };
+    const params: Record<string, unknown> = {
+      query: query.toLowerCase(),
+      ...tenantParams,
+    };
 
     if (timeRange?.from !== undefined) {
       timeFilter += " AND a.created_at >= $from";
@@ -210,7 +237,8 @@ async function anchorSearch(
 
     const result = await g.query(
       `MATCH (a:Anchor)
-       WHERE toLower(a.content) CONTAINS $query OR toLower(a.domain) CONTAINS $query${timeFilter}
+       WHERE (toLower(a.content) CONTAINS $query OR toLower(a.domain) CONTAINS $query)
+         AND ${tenantFragment}${timeFilter}
        RETURN a.id AS id, a.content AS content, a.domain AS domain,
               a.weight AS weight, a.created_at AS created_at`,
       { params },
@@ -243,10 +271,11 @@ async function anchorSearch(
  */
 async function enrichWithProvenance(
   result: IntermediateResult,
+  filter: TenantFilter,
 ): Promise<string | null> {
   if (result.type !== "thought") return null;
 
-  const hydrated = await hydrateNode(result.id, "Thought");
+  const hydrated = await hydrateNode(result.id, "Thought", filter);
   if (hydrated) {
     return `${hydrated.source_type}: ${hydrated.content}`;
   }
@@ -256,7 +285,12 @@ async function enrichWithProvenance(
 /**
  * Recall — multi-strategy retrieval from the Brain.
  *
+ * Phase 1E: recall is tenant-scoped. The `filter` parameter is required;
+ * a missing or invalid `callerUserId` throws at the strategy layer
+ * (fail-closed — no anonymous reads).
+ *
  * @param query     - Natural language query string
+ * @param filter    - TenantFilter — caller's userId + folio access + org scope
  * @param scope     - Optional scope filter (reserved for future use)
  * @param timeRange - Optional temporal filter { from?: epochMs, to?: epochMs }
  * @param asOf      - Point-in-time query: only return content that existed at this epoch ms.
@@ -270,22 +304,28 @@ async function enrichWithProvenance(
  */
 export async function recall(
   query: string,
+  filter: TenantFilter,
   scope?: string,
   timeRange?: TimeRange,
   asOf?: number,
   intent?: RecallIntent,
 ): Promise<RecallResponse> {
+  if (!filter || !filter.callerUserId) {
+    throw new Error(
+      "recall: TenantFilter with callerUserId is required (Phase 1E).",
+    );
+  }
   // Intent='when': run temporal Episode search alongside standard strategies.
   // Other intents use standard strategies but with score adjustments below.
   const useTemporalStrategy = intent === "when";
 
-  // Run strategies in parallel based on intent
+  // Run strategies in parallel based on intent — all four scoped by tenant.
   const [semanticResults, graphResults, anchorResults, temporalResults] =
     await Promise.all([
-      semanticSearch(query),
-      graphSearch(query, timeRange, asOf),
-      anchorSearch(query, timeRange, asOf),
-      useTemporalStrategy ? temporalSearch(query, asOf) : Promise.resolve([] as IntermediateResult[]),
+      semanticSearch(query, filter),
+      graphSearch(query, filter, timeRange, asOf),
+      anchorSearch(query, filter, timeRange, asOf),
+      useTemporalStrategy ? temporalSearch(query, filter, asOf) : Promise.resolve([] as IntermediateResult[]),
     ]);
 
   // Post-filter semantic results by asOf (vector search doesn't support pre-filtering)
@@ -336,10 +376,10 @@ export async function recall(
     (a, b) => b.score - a.score,
   );
 
-  // Enrich top results (up to 10) with provenance
+  // Enrich top results (up to 10) with provenance — tenant-scoped hydration.
   const topResults = sorted.slice(0, 10);
   const provenanceResults = await Promise.all(
-    topResults.map((r) => enrichWithProvenance(r)),
+    topResults.map((r) => enrichWithProvenance(r, filter)),
   );
 
   // Build final RecallResult array

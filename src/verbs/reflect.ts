@@ -11,7 +11,7 @@
  */
 
 import { getGraph } from "../graph.js";
-import type { ReflectResponse } from "../types.js";
+import type { ReflectResponse, TenantFilter } from "../types.js";
 
 interface TimeRange {
   from?: number;
@@ -21,22 +21,34 @@ interface TimeRange {
 /**
  * Run distillation over recent thoughts.
  *
+ * Phase 1E: scoped to the caller's tenant. Distillation never crosses
+ * tenant boundaries — Kyle's reflection won't surface Catherine's
+ * patterns, and vice versa.
+ *
+ * @param filter - TenantFilter identifying the caller
  * @param scope - Optional domain/entity filter
  * @param timeRange - Optional temporal filter (defaults to last 7 days)
  */
 export async function reflect(
+  filter: TenantFilter,
   scope?: string,
   timeRange?: TimeRange,
 ): Promise<ReflectResponse> {
+  if (!filter || !filter.callerUserId) {
+    throw new Error(
+      "reflect: TenantFilter with callerUserId is required (Phase 1E).",
+    );
+  }
   const g = getGraph();
   const now = Date.now();
   const defaultFrom = now - 7 * 24 * 60 * 60 * 1000; // 7 days
   const from = timeRange?.from ?? defaultFrom;
   const to = timeRange?.to ?? now;
+  const callerUserId = filter.callerUserId;
 
-  // 1. Gather recent thoughts in the period
+  // 1. Gather recent thoughts in the period — caller's tenant only.
   let scopeFilter = "";
-  const params: Record<string, unknown> = { from, to };
+  const params: Record<string, unknown> = { from, to, callerUserId };
 
   if (scope) {
     scopeFilter = " AND toLower(t.content) CONTAINS toLower($scope)";
@@ -45,7 +57,8 @@ export async function reflect(
 
   const thoughtsResult = await g.query(
     `MATCH (t:Thought)
-     WHERE t.created_at >= $from AND t.created_at <= $to${scopeFilter}
+     WHERE t.created_at >= $from AND t.created_at <= $to
+       AND t.tenant_user_id = $callerUserId${scopeFilter}
      RETURN t.id AS id, t.content AS content, t.created_at AS created_at
      ORDER BY t.created_at DESC`,
     { params },
@@ -63,8 +76,9 @@ export async function reflect(
   for (const thought of thoughts) {
     const entityResult = await g.query(
       `MATCH (t:Thought {id: $id})-[:extracted_from]->(ep:Episode)-[:involves]->(e:Entity)
+       WHERE e.tenant_user_id = $callerUserId
        RETURN e.name AS name`,
-      { params: { id: thought.id } },
+      { params: { id: thought.id, callerUserId } },
     );
     if (entityResult.data) {
       for (const row of entityResult.data as Record<string, unknown>[]) {
@@ -97,10 +111,12 @@ export async function reflect(
   const chainsResult = await g.query(
     `MATCH path = (t1:Thought)-[:evolves*1..5]->(t2:Thought)
      WHERE t2.created_at >= $from AND t2.created_at <= $to
+       AND t1.tenant_user_id = $callerUserId
+       AND t2.tenant_user_id = $callerUserId
      RETURN [n IN nodes(path) | n.id] AS chain,
             [n IN nodes(path) | n.content] AS contents
      LIMIT 10`,
-    { params: { from, to } },
+    { params: { from, to, callerUserId } },
   );
   if (chainsResult.data) {
     for (const row of chainsResult.data as Record<string, unknown>[]) {
@@ -120,18 +136,21 @@ export async function reflect(
   const anchorsResult = await g.query(
     `MATCH (a:Anchor)
      WHERE a.weight > 0
+       AND a.tenant_user_id = $callerUserId
      RETURN DISTINCT a.domain AS domain`,
+    { params: { callerUserId } },
   );
   if (anchorsResult.data) {
     for (const row of anchorsResult.data as Record<string, unknown>[]) {
       const domain = row.domain as string;
-      // Check if any thoughts in this domain exist in the period
+      // Check if any thoughts in this domain exist in the period (caller's tenant)
       const activityResult = await g.query(
         `MATCH (t:Thought)
          WHERE t.created_at >= $from AND t.created_at <= $to
            AND toLower(t.content) CONTAINS toLower($domain)
+           AND t.tenant_user_id = $callerUserId
          RETURN count(t) AS cnt`,
-        { params: { from, to, domain } },
+        { params: { from, to, domain, callerUserId } },
       );
       const cnt = activityResult.data
         ? ((activityResult.data[0] as Record<string, unknown>)?.cnt as number) || 0

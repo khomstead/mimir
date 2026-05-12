@@ -7,7 +7,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { EntityType, EdgeType, ExtractionResult } from "./types.js";
+import type { EntityType, EdgeType, ExtractionResult, TenantFilter } from "./types.js";
 import { findEntityByName } from "./graph.js";
 import { recordMimirCost } from "./cost-tracking.js";
 
@@ -257,6 +257,7 @@ const COMMON_WORDS = new Set([
  */
 async function getExistingEntityContext(
   text: string,
+  filter: TenantFilter,
 ): Promise<Record<string, string>> {
   const namePattern = /\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)\b/g;
   const candidates = new Set<string>();
@@ -265,9 +266,12 @@ async function getExistingEntityContext(
     if (match[1].length > 2) candidates.add(match[1]);
   }
 
+  // Phase 1E: candidate lookups scoped to caller's tenant. The LLM sees
+  // only the caller's view of any name match — never another user's
+  // entity summary, even when the same person/concept exists in both.
   const context: Record<string, string> = {};
   for (const name of Array.from(candidates).slice(0, 10)) {
-    const entity = await findEntityByName(name);
+    const entity = await findEntityByName(name, filter);
     if (entity) {
       context[entity.name] = entity.summary;
     }
@@ -410,6 +414,7 @@ function getAnthropicKey(): string | undefined {
 
 export async function extractFromText(
   text: string,
+  filter?: TenantFilter,
 ): Promise<ExtractionResult & { queued?: boolean }> {
   // Allow tests to force the deferred path
   if (process.env.BRAIN_DISABLE_LLM === "true") {
@@ -431,8 +436,14 @@ export async function extractFromText(
   try {
     const client = new Anthropic({ apiKey });
 
-    // Fetch existing entity context so the LLM can decide ADD vs UPDATE
-    const existingContext = await getExistingEntityContext(text);
+    // Fetch existing entity context so the LLM can decide ADD vs UPDATE.
+    // Phase 1E: scoped to caller's tenant if provided. If no filter is
+    // passed (callers from legacy paths), the LLM gets no existing-entity
+    // context — it will default to ADD-on-everything, which is safer
+    // than leaking cross-tenant entity summaries.
+    const existingContext = filter
+      ? await getExistingEntityContext(text, filter)
+      : {};
     const contextBlock = Object.keys(existingContext).length > 0
       ? `\n\nEXISTING ENTITIES (use for ADD/UPDATE/INVALIDATE decisions):\n${
           Object.entries(existingContext)

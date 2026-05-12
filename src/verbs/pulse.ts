@@ -9,20 +9,30 @@
  */
 
 import { getGraph, findEntityByName } from "../graph.js";
-import type { PulseResponse } from "../types.js";
+import type { PulseResponse, TenantFilter } from "../types.js";
 
 /**
  * Generate a status synthesis for an entity or domain.
  *
+ * Phase 1E: scoped to the caller's tenant. Thoughts, anchors, edges,
+ * and connections that belong to other users are structurally invisible.
+ *
  * @param entityOrDomain - Name of an entity or domain to pulse
+ * @param filter - TenantFilter identifying the caller
  */
-export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
+export async function pulse(entityOrDomain: string, filter: TenantFilter): Promise<PulseResponse> {
+  if (!filter || !filter.callerUserId) {
+    throw new Error(
+      "pulse: TenantFilter with callerUserId is required (Phase 1E).",
+    );
+  }
   const g = getGraph();
   const now = Date.now();
   const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+  const callerUserId = filter.callerUserId;
 
-  // Try to find as an entity first
-  const entity = await findEntityByName(entityOrDomain);
+  // Try to find as an entity first (tenant-scoped)
+  const entity = await findEntityByName(entityOrDomain, filter);
 
   // 1. Recent thoughts connected to this entity/domain
   let recentThoughts: PulseResponse["recent_thoughts"] = [];
@@ -33,18 +43,20 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
     const directResult = await g.query(
       `MATCH (t:Thought)-[]->(e:Entity {id: $entityId})
        WHERE t.created_at >= $since
+         AND t.tenant_user_id = $callerUserId
        RETURN DISTINCT t.id AS id, t.content AS content, t.created_at AS created_at
        ORDER BY t.created_at DESC
        LIMIT 10`,
-      { params: { entityId: entity.id, since: thirtyDaysAgo } },
+      { params: { entityId: entity.id, since: thirtyDaysAgo, callerUserId } },
     );
     const viaEpisodeResult = await g.query(
       `MATCH (t:Thought)-[:extracted_from]->(ep:Episode)-[:involves]->(e:Entity {id: $entityId})
        WHERE t.created_at >= $since
+         AND t.tenant_user_id = $callerUserId
        RETURN DISTINCT t.id AS id, t.content AS content, t.created_at AS created_at
        ORDER BY t.created_at DESC
        LIMIT 10`,
-      { params: { entityId: entity.id, since: thirtyDaysAgo } },
+      { params: { entityId: entity.id, since: thirtyDaysAgo, callerUserId } },
     );
 
     // Merge and deduplicate
@@ -69,15 +81,16 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
     const thoughtsResult = { data: recentThoughts }; // for compatibility below
     void thoughtsResult;
   } else {
-    // Domain-centric: find thoughts that mention this domain in their Episode
+    // Domain-centric: find caller's thoughts that mention this domain.
     const thoughtsResult = await g.query(
       `MATCH (t:Thought)
        WHERE t.created_at >= $since
          AND toLower(t.content) CONTAINS toLower($domain)
+         AND t.tenant_user_id = $callerUserId
        RETURN t.id AS id, t.content AS content, t.created_at AS created_at
        ORDER BY t.created_at DESC
        LIMIT 10`,
-      { params: { domain: entityOrDomain, since: thirtyDaysAgo } },
+      { params: { domain: entityOrDomain, since: thirtyDaysAgo, callerUserId } },
     );
     if (thoughtsResult.data) {
       recentThoughts = (thoughtsResult.data as Record<string, unknown>[]).map((row) => ({
@@ -93,9 +106,11 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
   const searchDomain = entity?.type === "domain" ? entity.name : entityOrDomain;
   const anchorsResult = await g.query(
     `MATCH (a:Anchor)
-     WHERE toLower(a.domain) CONTAINS toLower($domain) AND a.weight > 0
+     WHERE toLower(a.domain) CONTAINS toLower($domain)
+       AND a.weight > 0
+       AND a.tenant_user_id = $callerUserId
      RETURN a.id AS id, a.content AS content, a.domain AS domain, a.weight AS weight`,
-    { params: { domain: searchDomain } },
+    { params: { domain: searchDomain, callerUserId } },
   );
   if (anchorsResult.data) {
     activeAnchors = (anchorsResult.data as Record<string, unknown>[]).map((row) => ({
@@ -114,9 +129,10 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
     const commitResult = await g.query(
       `MATCH (t:Thought)-[:extracted_from]->(ep:Episode)-[:involves]->(e:Entity {id: $entityId})
        WHERE t.created_at >= $since
+         AND t.tenant_user_id = $callerUserId
        RETURN t.id AS id, t.content AS content
        LIMIT 5`,
-      { params: { entityId: entity.id, since: thirtyDaysAgo } },
+      { params: { entityId: entity.id, since: thirtyDaysAgo, callerUserId } },
     );
     if (commitResult.data) {
       // Filter for commitment-like content
@@ -138,15 +154,17 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
   if (entity) {
     const connResult = await g.query(
       `MATCH (e:Entity {id: $entityId})-[r]->(other:Entity)
+       WHERE other.tenant_user_id = $callerUserId
        RETURN DISTINCT other.name AS name, other.type AS type, type(r) AS relationship
        LIMIT 15`,
-      { params: { entityId: entity.id } },
+      { params: { entityId: entity.id, callerUserId } },
     );
     const connResult2 = await g.query(
       `MATCH (other:Entity)-[r]->(e:Entity {id: $entityId})
+       WHERE other.tenant_user_id = $callerUserId
        RETURN DISTINCT other.name AS name, other.type AS type, type(r) AS relationship
        LIMIT 15`,
-      { params: { entityId: entity.id } },
+      { params: { entityId: entity.id, callerUserId } },
     );
     // Merge both directions
     const allConns = [
@@ -174,9 +192,11 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
     const tensionResult = await g.query(
       `MATCH (t:Thought)-[:tensions_with]->(a:Anchor),
              (t)-[]->(e:Entity {id: $entityId})
+       WHERE t.tenant_user_id = $callerUserId
+         AND a.tenant_user_id = $callerUserId
        RETURN a.content AS anchor_content, t.content AS tension
        LIMIT 5`,
-      { params: { entityId: entity.id } },
+      { params: { entityId: entity.id, callerUserId } },
     );
     if (tensionResult.data) {
       unresolvedTensions = (tensionResult.data as Record<string, unknown>[]).map((row) => ({
@@ -194,14 +214,16 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
     const cntResult = await g.query(
       `MATCH (t:Thought)-[]->(e:Entity {id: $id})
        WHERE t.created_at >= $since
+         AND t.tenant_user_id = $callerUserId
        RETURN count(DISTINCT t) AS cnt`,
-      { params: { id: entity.id, since: thirtyDaysAgo } },
+      { params: { id: entity.id, since: thirtyDaysAgo, callerUserId } },
     );
     const cntViaEp = await g.query(
       `MATCH (t:Thought)-[:extracted_from]->(ep:Episode)-[:involves]->(e:Entity {id: $id})
        WHERE t.created_at >= $since
+         AND t.tenant_user_id = $callerUserId
        RETURN count(DISTINCT t) AS cnt`,
-      { params: { id: entity.id, since: thirtyDaysAgo } },
+      { params: { id: entity.id, since: thirtyDaysAgo, callerUserId } },
     );
     const cnt1 = cntResult.data ? ((cntResult.data[0] as Record<string, unknown>)?.cnt as number) || 0 : 0;
     const cnt2 = cntViaEp.data ? ((cntViaEp.data[0] as Record<string, unknown>)?.cnt as number) || 0 : 0;
@@ -209,9 +231,11 @@ export async function pulse(entityOrDomain: string): Promise<PulseResponse> {
   } else {
     const cntResult = await g.query(
       `MATCH (t:Thought)
-       WHERE t.created_at >= $since AND toLower(t.content) CONTAINS toLower($id)
+       WHERE t.created_at >= $since
+         AND toLower(t.content) CONTAINS toLower($id)
+         AND t.tenant_user_id = $callerUserId
        RETURN count(t) AS cnt`,
-      { params: { id: entityOrDomain, since: thirtyDaysAgo } },
+      { params: { id: entityOrDomain, since: thirtyDaysAgo, callerUserId } },
     );
     totalThoughtCount = cntResult.data
       ? ((cntResult.data[0] as Record<string, unknown>)?.cnt as number) || 0

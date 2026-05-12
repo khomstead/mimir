@@ -2,15 +2,66 @@
 
 > Claude Code reads this file automatically. It describes the architecture, patterns, and conventions for the Mimir knowledge graph service.
 
-## ⚠️ MULTI-TENANCY: NOT SUPPORTED
+## Multi-Tenancy (Phase 1E — shipped 2026-05-11)
 
-**Mimir is single-tenant by design as of 2026-05-09.** Every Episode, Entity, Thought, Anchor, and Edge in the graph belongs to one human user (Kyle, in our deployment). There is no `userId` / `tenant` / `namespace` field on any node. All retain / recall / pulse / reflect calls return data across the whole graph.
+**Mimir is multi-tenant as of Phase 1E.** Every Episode, Thought, Entity, and Anchor carries a `tenant_user_id` (required) + optional `tenant_org_id` + optional `folio_ids` array. Recall queries scope at the Cypher WHERE-clause level — content owned by other users is structurally invisible unless explicitly shared via folio access.
 
-**Do NOT add a second user without doing the userId-scoping refactor first.** Onboarding user #2 against this single-tenant graph would mix their captured preferences, places, and events into Kyle's pattern-of-life intelligence (and vice versa) — a data leak that breaks the trust model on day one.
+### Sharing model: READ-PREDICATE (not clone)
 
-The refactor is tracked as gobot task #62: schema-add `userId` to every node, require `X-Mimir-User-Id` on every HTTP call, thread userId through `mimir-client.ts` and `processIntents`, write a migration that tags existing data with Kyle's userId. Rough estimate: 1–2 days of focused work, plus a design conversation about shared knowledge (partnership journal, ops graph, family-shared facts) — does that live in a separate "shared" namespace, or per-user with explicit shares?
+- **Episodes/Thoughts**: NEVER cloned. Live in retainer's tenant; surfaced cross-boundary via `folio_ids ∩ caller_allowed_folios` predicate.
+- **Entities/fact-edges**: STRICTLY per-tenant. Each user has their own "Kyle Homstead" node. INVALIDATE/UPDATE never crosses tenants — cross-user mutation attempts silently no-op via the MATCH tenant filter.
+- **Revocation**: when a folio share is revoked, the recipient's `allowed_folios` shrinks → cross-tenant reads stop instantly (no Mimir action needed). In parallel, the forget cascade marks recipient's OWN Episodes/Thoughts/Entities that reference the revoked folio (via `folio_ids`) as `tenant_invisible_after = now`. Sharer's view untouched (Episode = ground truth invariant preserved).
 
-Until that refactor lands, the GoBot daemon enforces single-tenant operation at startup: if `GOBOT_DEFAULT_USER_ID` is unset AND Mimir is reachable, the daemon refuses to start. That gate prevents silent degradation when the Phase-1 fallback is removed prematurely.
+### The 6 FAIL-CLOSED contracts (from `src/__tests__/tenant-isolation.test.ts`)
+
+Future engineers — these tests guard the security boundary. If they fail, the build does not ship.
+
+| # | Invariant | Test |
+|---|-----------|------|
+| A | retain as A, recall as B → empty | `cross-tenant entity lookup returns null` + `Thought vector search returns empty` |
+| B | retain as A, recall as A → expected results | `own-tenant lookup works (no false-negative)` |
+| C | retain as A in folio X, B has X access → B's recall sees A's content | `folio share grants read access to sharer's content` |
+| D | revoke folio share → forget cascade hides recipient's derived Episodes; sharer's untouched | `forget cascade marks recipient's derived Episodes invisible` |
+| E | Cross-user INVALIDATE = downgrade-only — Bob can't poison Alice's view | `cross-user INVALIDATE silently no-ops` + `cross-user UPDATE silently no-ops` |
+| F | Graph helpers fail-closed without TenantFilter — anonymous reads throw | `findEntityByName / vectorSearch / invalidate / update / createNode without filter throws` |
+
+**Do not "simplify" away any of these tests.** Removing a tenant arg from a graph helper to "clean up the API" is removing a security boundary. The simplification IS the regression.
+
+### HTTP API contract (Phase 1E)
+
+Every `/api/*` endpoint (except `/health`) reads three tenant headers from the request:
+
+```
+X-Mimir-User-Id      Convex `users` _id of the caller (required by Phase 1E gate)
+X-Mimir-Active-Org   Convex `organizations` _id (optional)
+X-Mimir-Folio-Ids    comma-separated `mosscap_folios` _ids (optional)
+```
+
+Cutover gate via `MIMIR_REQUIRE_TENANT_HEADER` env:
+- `false` (default — Phase 1E cutover window): missing `X-Mimir-User-Id` → fall back to `GOBOT_DEFAULT_USER_ID` and log a CUTOVER WARN. This lets gobot+Mimir deploys land non-atomically.
+- `true` (post-cutover): missing `X-Mimir-User-Id` → **401 fail-closed**. No silent default. Test suite asserts this is the active behavior.
+
+The Bearer-auth gate (`MIMIR_SHARED_SECRET`) is still in place — tenant headers AUTHORIZE which tenant's view is returned; the Bearer secret AUTHENTICATES the caller. Both gates required.
+
+### Forget cascade endpoint (Phase 1E)
+
+`POST /api/forget-cascade` with body `{folio_id, revoked_user_id}` triggers `forgetByShareRevocation`. Invoked by the gobot daemon's `mimirForgetCascade` Convex action, which is enqueued by `folioMembers.removeMember` and retried via cron on failure (~1 minute backoff for unprocessed `share_revocation_events` rows).
+
+NOT tenant-filtered by caller — privileged operation gated by the Bearer-auth secret. Only the gobot daemon can invoke it.
+
+### Backfill migration (Phase 1E one-shot)
+
+`scripts/migrate-add-tenant.ts` stamps every untagged legacy Episode/Thought/Entity/Anchor with `GOBOT_DEFAULT_USER_ID` (Kyle's userId). Run during the Phase 1E deploy:
+
+1. `launchctl unload ~/Library/LaunchAgents/com.speki.mimir.plist` (release FalkorDB lock)
+2. `GOBOT_DEFAULT_USER_ID=<kyle-id> bun run scripts/migrate-add-tenant.ts`
+3. `launchctl load ~/Library/LaunchAgents/com.speki.mimir.plist` (restart service)
+
+Idempotent (skips already-stamped nodes). ~30s downtime; acceptable for Catherine pilot.
+
+### Phase 1G dependency: entity-dedup at org scale
+
+The strict per-tenant entity isolation chosen for Phase 1E is correct for Catherine pilot (2 users), but at Lighthouse Holyoke scale (30 users × shared context like "Catherine the teacher" or "the Holyoke building") it produces ~30x entity duplication for organization-wide entities. **Phase 1G's aggregation queries are the right phase to land per-org entity dedup** — multiple users in the same org share entities; cross-org entities stay separate. This is a known-deferred scaling concern, not a forgotten cost.
 
 ## What Mimir Is
 

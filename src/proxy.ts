@@ -33,6 +33,35 @@ const OFFLINE_MSG =
 // returns 401.
 const MIMIR_BEARER = process.env.MIMIR_SHARED_SECRET ?? "";
 
+// ───────────────────────────────────────────────────────────────────────────
+// Sprint A.1 + F-04 — per-session tenant routing (catherine-prep-backend).
+//
+// The gobot daemon sets `MOSSCAP_ACTOR_USER_ID` on the Claude Code
+// subprocess env before spawning. This stdio proxy inherits that env from
+// its parent (Claude Code), so we can read it on every tool call and pass
+// it through as `X-Mimir-User-Id` to the Mimir HTTP service. Mimir's
+// Phase 1E tenant gate validates the header.
+//
+// Three env names checked in priority order (so the proxy works during
+// the Phase 1 cutover window AND for legacy single-tenant invocations):
+//   1. MOSSCAP_ACTOR_USER_ID  — set per turn by the daemon (Sprint A.1)
+//   2. MIMIR_USER_ID          — daemon-wide legacy override
+//   3. GOBOT_DEFAULT_USER_ID  — Phase 1 cutover fallback (Kyle)
+//
+// Privacy clause 13 (proposal v2.2 §11.5): "X-Mimir-User-Id MUST be set
+// to the calling user's userId, sourced from mosscap_sessions.userId —
+// never the daemon's identity." This proxy now honors that contract.
+// ───────────────────────────────────────────────────────────────────────────
+
+function resolveCallerUserId(): string | undefined {
+  return (
+    process.env.MOSSCAP_ACTOR_USER_ID ||
+    process.env.MIMIR_USER_ID ||
+    process.env.GOBOT_DEFAULT_USER_ID ||
+    undefined
+  );
+}
+
 function commonHeaders() {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -41,6 +70,8 @@ function commonHeaders() {
   if (MIMIR_BEARER) {
     headers["Authorization"] = `Bearer ${MIMIR_BEARER}`;
   }
+  const userId = resolveCallerUserId();
+  if (userId) headers["X-Mimir-User-Id"] = userId;
   return headers;
 }
 
@@ -51,6 +82,8 @@ function readHeaders() {
   if (MIMIR_BEARER) {
     headers["Authorization"] = `Bearer ${MIMIR_BEARER}`;
   }
+  const userId = resolveCallerUserId();
+  if (userId) headers["X-Mimir-User-Id"] = userId;
   return headers;
 }
 

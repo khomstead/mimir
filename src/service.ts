@@ -21,6 +21,7 @@ import { anchor } from "./verbs/anchor.js";
 import { triage } from "./verbs/triage.js";
 import { processQueue } from "./verbs/process-queue.js";
 import { forget, forgetByShareRevocation } from "./verbs/forget.js";
+import { explainEpisode } from "./verbs/explain-episode.js";
 import type { TenantStamp, TenantFilter } from "./types.js";
 
 const DATA_PATH =
@@ -387,6 +388,28 @@ async function handleRequest(req: Request): Promise<Response> {
     return jsonResponse(result);
   }
 
+  // ── Explain Episode (GET /api/episode/:id) ──
+  // Phase B2 of memory-hover-indicator sprint. Returns the entities +
+  // fact-edges + crosslinks Mimir extracted from a single Episode, so
+  // Observatory's "Show what Mosscap learned" reveal can render the graph
+  // layer without requiring a separate full graph browser surface.
+  //
+  // Tenant-scoped: callers can only explain episodes they own OR have
+  // folio-shared access to. Cross-tenant probes return status: "not_found"
+  // (indistinguishable from a genuinely missing id — fail-closed for
+  // existence-leak protection).
+  if (path.startsWith("/api/episode/") && req.method === "GET") {
+    const episodeId = path.slice("/api/episode/".length);
+    if (!episodeId) return errorResponse("Missing episode id in path");
+    const filterResult = extractTenantFilter(req);
+    if ("denied" in filterResult) return filterResult.denied;
+    const result = await explainEpisode(episodeId, filterResult.filter);
+    // 404 for not_found so the proxy can distinguish from 500 transport
+    // failure; body still carries the typed status field for callers that
+    // parse JSON before checking the status code.
+    return jsonResponse(result, result.status === "found" ? 200 : 404);
+  }
+
   // ── Context (GET /api/context?q=...&as_of=...) ──
   // Endpoint for GoBot prompt injection — returns formatted text with full
   // source material. Implements "Recursive Hydration": when a Thought or
@@ -672,6 +695,7 @@ async function main() {
   console.log("  POST /api/process-queue");
   console.log("  POST /api/forget");
   console.log("  POST /api/forget-cascade  (Phase 1E share-revocation)");
+  console.log("  GET  /api/episode/:id     (Phase B2 explain — entities + edges + crosslinks)");
   console.log(
     `[mimir:phase-1e] tenant-header gate: ${REQUIRE_TENANT_HEADER ? "ENFORCED (fail-closed)" : "CUTOVER WINDOW (fallback to GOBOT_DEFAULT_USER_ID)"}`,
   );

@@ -593,19 +593,28 @@ async function handleRequest(req: Request): Promise<Response> {
       }
     }
 
-    // ── Phase 3: Active anchors (caller's tenant only) ──
-    // Interim LIMIT 12 (was 5): a query-independent first-N cap silently
-    // dropped anchors once a tenant has >5 (e.g. the manifesto's 6–8
-    // Lighthouse pedagogy anchors). 12 covers near-term need. The proper
-    // fix — relevance-rank anchors to the turn query (needs anchor
-    // embeddings) + an org-canon grant so org anchors surface for members —
-    // is bundled into the P3 anchor overhaul.
+    // ── Phase 3: Active anchors (caller's own + org canon) ──
+    // P3 org-anchor grant: an org member sees their OWN anchors PLUS the org's
+    // canon anchors (tenant_org_id == active org AND org_canon) — so Lighthouse
+    // pedagogy anchors promoted to org canon are inherited by every workspace
+    // member's always-on context. Additive (owner-only when no active org;
+    // cross-user isolation stays on the ownership clause). Mirrors the recall
+    // grant in graph.applyTenantFilter. LIMIT 12 (interim; relevance-ranking
+    // needs anchor embeddings — remaining anchor-overhaul card scope).
+    const anchorOrgGrant = filter.activeOrgScope
+      ? " OR (a.tenant_org_id = $orgScope AND a.org_canon = true)"
+      : "";
     const anchorsResult = await g.query(
       `MATCH (a:Anchor)
        WHERE a.weight > 0
-         AND a.tenant_user_id = $callerUserId
+         AND (a.tenant_user_id = $callerUserId${anchorOrgGrant})
        RETURN a.content AS c, a.domain AS d LIMIT 12`,
-      { params: { callerUserId: filter.callerUserId } },
+      {
+        params: {
+          callerUserId: filter.callerUserId,
+          ...(filter.activeOrgScope ? { orgScope: filter.activeOrgScope } : {}),
+        },
+      },
     );
 
     // ── Build output ──

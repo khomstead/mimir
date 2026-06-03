@@ -304,12 +304,25 @@ export async function retain(
         // Phase 1E: scope anchor scan to caller's tenant (anchors are
         // per-user philosophies; one user's anchor doesn't constrain
         // another's content).
+        // P3 org-anchor grant: tension-check new content against the caller's
+        // OWN anchors PLUS the active org's canon anchors — so org-level
+        // (e.g. Lighthouse pedagogy) anchors flag align/challenge for every
+        // member's content, not just the anchor owner's. Additive.
+        const anchorOrgGrant = tenant.organizationId
+          ? " OR (a.tenant_org_id = $orgScope AND a.org_canon = true)"
+          : "";
         const anchorsResult = await g.query(
           `MATCH (a:Anchor)
            WHERE a.domain = $domain AND a.weight > 0
-             AND a.tenant_user_id = $callerUserId
+             AND (a.tenant_user_id = $callerUserId${anchorOrgGrant})
            RETURN a.id AS id, a.content AS content`,
-          { params: { domain, callerUserId: tenant.userId } },
+          {
+            params: {
+              domain,
+              callerUserId: tenant.userId,
+              ...(tenant.organizationId ? { orgScope: tenant.organizationId } : {}),
+            },
+          },
         );
         if (anchorsResult.data) {
           for (const row of anchorsResult.data as Record<string, unknown>[]) {

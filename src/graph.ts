@@ -26,6 +26,7 @@
 import { FalkorDB } from "falkordblite";
 import type { Graph } from "falkordb";
 import type { EdgeType, BeliefState, TenantStamp, TenantFilter } from "./types.js";
+import { EMBEDDING_DIM } from "./embeddings.js";
 
 /**
  * Source authority scores — used for contradiction resolution.
@@ -78,9 +79,14 @@ export async function initGraph(dataPath: string): Promise<Graph> {
   await graph
     .query("CREATE INDEX FOR (ep:Episode) ON (ep.event_at)")
     .catch(() => {});
+  // Vector index dimension is the single source of truth in embeddings.ts
+  // (EMBEDDING_DIM). Idempotent: a no-op if an index at this dimension already
+  // exists. NOTE: if an index exists at a DIFFERENT dimension, this CREATE
+  // silently no-ops (caught) and leaves the stale index — the dimension-migration
+  // backfill (scripts/reembed-all.ts) must DROP the old index first.
   await graph
     .query(
-      "CREATE VECTOR INDEX FOR (t:Thought) ON (t.embedding) OPTIONS {dimension: 1536, similarityFunction: 'cosine'}"
+      `CREATE VECTOR INDEX FOR (t:Thought) ON (t.embedding) OPTIONS {dimension: ${EMBEDDING_DIM}, similarityFunction: 'cosine'}`
     )
     .catch(() => {});
   // ─── Phase 1E multi-tenancy indexes ─────────────────────────
@@ -108,6 +114,47 @@ export async function initGraph(dataPath: string): Promise<Graph> {
     .catch(() => {});
 
   return graph;
+}
+
+// ─── Vector index migration helpers ─────────────────────────
+// Used by scripts/reembed-all.ts to migrate the Thought.embedding vector index
+// to a new dimension. The init-time CREATE above is idempotent and silently
+// no-ops against a stale index of a different dimension, so a dimension change
+// REQUIRES an explicit drop before re-embedding.
+
+/**
+ * Drop the Thought.embedding vector index if it exists. Idempotent — a missing
+ * index is not an error. Returns true if the drop ran without throwing.
+ */
+export async function dropVectorIndex(): Promise<boolean> {
+  const g = getGraph();
+  try {
+    await g.query("DROP VECTOR INDEX FOR (t:Thought) ON (t.embedding)");
+    return true;
+  } catch (err) {
+    // FalkorDB throws if the index doesn't exist — that's a benign no-op for our
+    // purposes. Surface anything unexpected for the migration operator.
+    console.error(
+      `[mimir:graph] dropVectorIndex: ${(err as Error).message} (ok if index was absent)`,
+    );
+    return false;
+  }
+}
+
+/**
+ * (Re)create the Thought.embedding vector index at EMBEDDING_DIM. Idempotent.
+ */
+export async function createVectorIndex(): Promise<void> {
+  const g = getGraph();
+  await g
+    .query(
+      `CREATE VECTOR INDEX FOR (t:Thought) ON (t.embedding) OPTIONS {dimension: ${EMBEDDING_DIM}, similarityFunction: 'cosine'}`,
+    )
+    .catch((err: Error) => {
+      console.error(
+        `[mimir:graph] createVectorIndex: ${err.message} (ok if index already exists)`,
+      );
+    });
 }
 
 // ─── Phase 1E: Tenant filter helpers ────────────────────────
@@ -483,7 +530,19 @@ export async function vectorSearch(
     );
   }
 
-  const overFetchK = Math.max(k * 4, k + 5);
+  // Over-fetch generously. TWO reasons compound:
+  //  1. HNSW recall: FalkorDB's vector index is approximate — the search breadth
+  //     (ef) scales with the requested count. Heavily-duplicated content forms
+  //     dense clusters that trap a small-k traversal in a local minimum, so it
+  //     misses the TRUE nearest neighbours. Empirically (3784-node graph), k=40
+  //     returned a wrong top set (min distance 0.335) while k≥100 found the real
+  //     nearest (0.271). A small over-fetch silently degrades ranking quality.
+  //  2. Tenant filtering happens AFTER the index call (db.idx.vector.queryNodes
+  //     has no pre-filter), so the caller's relevant nodes can sit past a small
+  //     candidate window when other tenants' content crowds the top.
+  // Cost is negligible at this scale (k=1000 ≈ 15ms), and the cap bounds it as
+  // the graph grows. Take top-k AFTER tenant filtering below.
+  const overFetchK = Math.min(Math.max(k * 20, 256), 1000);
   const allowedFolios = filter.includeFolioIds ?? [];
   const orgScope = filter.activeOrgScope ?? null;
   const now = Date.now();

@@ -40,26 +40,56 @@ async function semanticSearch(
   query: string,
   filter: TenantFilter,
 ): Promise<IntermediateResult[]> {
+  // FAIL LOUD: embedder errors used to be swallowed by a bare catch → semantic
+  // search silently returned nothing for weeks. A dead embedder is now logged,
+  // not hidden.
+  let queryEmbedding: number[];
   try {
-    const queryEmbedding = await generateEmbedding(query);
-    const results = await vectorSearch(queryEmbedding, 10, filter);
+    queryEmbedding = await generateEmbedding(query);
+  } catch (err) {
+    console.error(
+      `[mimir:recall] semantic search DISABLED — embedder error: ${(err as Error).message}`,
+    );
+    return [];
+  }
 
-    return results.map((r) => ({
+  let results: Awaited<ReturnType<typeof vectorSearch>>;
+  try {
+    results = await vectorSearch(queryEmbedding, 10, filter);
+  } catch (err) {
+    // Vector search may legitimately fail if no Thought nodes exist yet, but it
+    // can also mask a real index/dimension problem — surface it.
+    console.error(
+      `[mimir:recall] vectorSearch failed: ${(err as Error).message}`,
+    );
+    return [];
+  }
+
+  const mapped: IntermediateResult[] = [];
+  for (const r of results) {
+    // A non-finite cosine distance means a degenerate stored vector — almost
+    // always a node that hasn't been re-embedded yet (legacy zero vector).
+    // Do NOT fake a 0.5 score; log the degraded node and exclude it from ranking.
+    if (!Number.isFinite(r.score)) {
+      console.error(
+        `[mimir:recall] degraded: non-finite distance for thought ${r.id} ` +
+          `(likely an un-backfilled zero vector) — excluding from results`,
+      );
+      continue;
+    }
+    mapped.push({
       id: r.id,
       content: r.content,
       type: "thought" as const,
-      // Convert distance to similarity (FalkorDB cosine returns distance).
-      // Non-finite scores (e.g. NaN from zero-vector embeddings in test) default to 0.5.
-      score: Number.isFinite(r.score) ? 1 - r.score : 0.5,
+      // FalkorDB cosine returns a distance; similarity = 1 - distance.
+      score: 1 - r.score,
       source: "semantic",
       created_at: r.created_at,
       connections: [],
       strategies: new Set(["semantic"]),
-    }));
-  } catch {
-    // Vector search may fail if no Thought nodes exist yet
-    return [];
+    });
   }
+  return mapped;
 }
 
 /**

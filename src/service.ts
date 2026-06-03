@@ -117,6 +117,10 @@ function parseTenantHeaders(req: Request): {
   userId: string | null;
   activeOrgScope: string | undefined;
   folioIds: string[];
+  // Knowledge Architecture P1 (2026-06-03):
+  activeFolioIds: string[];          // active workspace (boost signal, subset of folioIds)
+  activeOrgName: string | undefined; // for the "<Org> canon" provenance label
+  orgCanon: boolean;                 // write-side: mark this retain as org canon
 } {
   const userId = req.headers.get("x-mimir-user-id") || null;
   const activeOrgScope = req.headers.get("x-mimir-active-org") || undefined;
@@ -125,7 +129,15 @@ function parseTenantHeaders(req: Request): {
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  return { userId, activeOrgScope, folioIds };
+  const activeFolioHeader = req.headers.get("x-mimir-active-folio-ids") || "";
+  const activeFolioIds = activeFolioHeader
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const activeOrgName = req.headers.get("x-mimir-active-org-name") || undefined;
+  const orgCanon =
+    (req.headers.get("x-mimir-org-canon") || "").toLowerCase() === "true";
+  return { userId, activeOrgScope, folioIds, activeFolioIds, activeOrgName, orgCanon };
 }
 
 /**
@@ -135,7 +147,7 @@ function parseTenantHeaders(req: Request): {
  * fallback is enabled and a default userId exists.
  */
 function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Response } {
-  const { userId, activeOrgScope, folioIds } = parseTenantHeaders(req);
+  const { userId, activeOrgScope, folioIds, orgCanon } = parseTenantHeaders(req);
 
   if (userId) {
     return {
@@ -143,6 +155,7 @@ function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Re
         userId,
         organizationId: activeOrgScope,
         folioIds: folioIds.length > 0 ? folioIds : undefined,
+        orgCanon: orgCanon || undefined,
       },
     };
   }
@@ -182,6 +195,7 @@ function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Re
       userId: DEFAULT_TENANT_FALLBACK_USER_ID,
       organizationId: activeOrgScope,
       folioIds: folioIds.length > 0 ? folioIds : undefined,
+      orgCanon: orgCanon || undefined,
     },
   };
 }
@@ -193,11 +207,17 @@ function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Re
 function extractTenantFilter(req: Request): { filter: TenantFilter } | { denied: Response } {
   const r = extractTenantStamp(req);
   if ("denied" in r) return { denied: r.denied };
+  // Read-only soft-bias signals (Knowledge Architecture P1): the active
+  // workspace (boost) + active org display name (provenance label). These
+  // never gate visibility — they only foreground + label.
+  const { activeFolioIds, activeOrgName } = parseTenantHeaders(req);
   return {
     filter: {
       callerUserId: r.stamp.userId,
       activeOrgScope: r.stamp.organizationId,
       includeFolioIds: r.stamp.folioIds,
+      activeFolioIds: activeFolioIds.length > 0 ? activeFolioIds : undefined,
+      activeOrgName,
     },
   };
 }

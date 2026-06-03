@@ -11,7 +11,7 @@
 
 import { getGraph, vectorSearch, hydrateNode, applyTenantFilter } from "../graph.js";
 import { generateEmbedding } from "../embeddings.js";
-import type { RecallResult, RecallResponse, TenantFilter } from "../types.js";
+import type { RecallResult, RecallResponse, RecallOrigin, TenantFilter } from "../types.js";
 
 interface TimeRange {
   from?: number;
@@ -21,7 +21,15 @@ interface TimeRange {
 /** Intent hint shapes which retrieval strategies run and how results are ranked. */
 type RecallIntent = "when" | "who" | "why" | "what" | "how";
 
-interface IntermediateResult {
+/** Tenant stamps carried alongside each result for soft-bias + provenance. */
+interface NodeStamps {
+  ownerUserId?: string;
+  orgId?: string;
+  folioIds?: string[];
+  orgCanon?: boolean;
+}
+
+interface IntermediateResult extends NodeStamps {
   id: string;
   content: string;
   type: RecallResult["type"];
@@ -30,6 +38,52 @@ interface IntermediateResult {
   created_at: number;
   connections: string[];
   strategies: Set<string>;
+}
+
+// Soft-bias boosts (Knowledge Architecture P1, grilled Q2). Foreground
+// curated canon strongest, then the active workspace; personal + plain
+// shared content keep their baseline so they still surface (not a firewall).
+const ORG_CANON_BOOST = 0.25;
+const WORKSPACE_BOOST = 0.15;
+
+/**
+ * Compute the provenance origin of a result from its tenant stamps + the
+ * caller's filter. Trust comes from visible sourcing (grilled Q2). The
+ * tier precedence is canon > workspace > shared > personal.
+ */
+function computeOrigin(node: NodeStamps, filter: TenantFilter): RecallOrigin {
+  const activeFolios = filter.activeFolioIds ?? [];
+  const isOrgCanon =
+    !!filter.activeOrgScope &&
+    node.orgId === filter.activeOrgScope &&
+    node.orgCanon === true;
+  if (isOrgCanon) {
+    return {
+      tier: "org_canon",
+      label: filter.activeOrgName ? `${filter.activeOrgName} canon` : "Org canon",
+      orgId: node.orgId,
+      folioIds: node.folioIds,
+    };
+  }
+  const inActiveWorkspace =
+    activeFolios.length > 0 &&
+    (node.folioIds ?? []).some((f) => activeFolios.includes(f));
+  if (inActiveWorkspace) {
+    return { tier: "workspace", label: "This workspace", folioIds: node.folioIds };
+  }
+  // Owned by the caller with no shared scope → their own personal note.
+  if (node.ownerUserId && node.ownerUserId === filter.callerUserId) {
+    return { tier: "personal", label: "Your personal note" };
+  }
+  // Visible via folio share but not the active workspace.
+  return { tier: "shared", label: "Shared with you", folioIds: node.folioIds };
+}
+
+/** Score adjustment a given origin earns (soft-bias foregrounding). */
+function originBoost(origin: RecallOrigin): number {
+  if (origin.tier === "org_canon") return ORG_CANON_BOOST;
+  if (origin.tier === "workspace") return WORKSPACE_BOOST;
+  return 0;
 }
 
 /**
@@ -87,6 +141,10 @@ async function semanticSearch(
       created_at: r.created_at,
       connections: [],
       strategies: new Set(["semantic"]),
+      ownerUserId: r.tenant_user_id,
+      orgId: r.tenant_org_id,
+      folioIds: r.folio_ids,
+      orgCanon: r.org_canon,
     });
   }
   return mapped;
@@ -138,6 +196,8 @@ async function graphSearch(
          AND ${tenantFragment}${timeFilter}
        OPTIONAL MATCH (t)-[]->(e:Entity)
        RETURN t.id AS id, t.content AS content, t.created_at AS created_at,
+              t.tenant_user_id AS tenant_user_id, t.tenant_org_id AS tenant_org_id,
+              t.folio_ids AS folio_ids, t.org_canon AS org_canon,
               collect(DISTINCT e.name) AS entity_names`,
       { params },
     );
@@ -155,6 +215,10 @@ async function graphSearch(
       created_at: row.created_at as number,
       connections: (row.entity_names as string[]) || [],
       strategies: new Set(["graph"]),
+      ownerUserId: row.tenant_user_id as string | undefined,
+      orgId: row.tenant_org_id as string | undefined,
+      folioIds: (row.folio_ids as string[] | undefined) ?? undefined,
+      orgCanon: row.org_canon === true,
     }));
   } catch {
     return [];
@@ -199,7 +263,9 @@ async function temporalSearch(
        RETURN ep.id AS ep_id, ep.content AS ep_content,
               ep.event_at AS event_at, ep.timestamp AS ingested_at,
               t.id AS thought_id, t.content AS thought_content,
-              t.created_at AS thought_created_at
+              t.created_at AS thought_created_at,
+              t.tenant_user_id AS tenant_user_id, t.tenant_org_id AS tenant_org_id,
+              t.folio_ids AS folio_ids, t.org_canon AS org_canon
        ORDER BY ep.event_at DESC
        LIMIT 10`,
       { params },
@@ -220,6 +286,10 @@ async function temporalSearch(
         created_at: row.thought_created_at as number,
         connections: [],
         strategies: new Set(["temporal"]),
+        ownerUserId: row.tenant_user_id as string | undefined,
+        orgId: row.tenant_org_id as string | undefined,
+        folioIds: (row.folio_ids as string[] | undefined) ?? undefined,
+        orgCanon: row.org_canon === true,
       }));
   } catch {
     return [];
@@ -270,7 +340,9 @@ async function anchorSearch(
        WHERE (toLower(a.content) CONTAINS $query OR toLower(a.domain) CONTAINS $query)
          AND ${tenantFragment}${timeFilter}
        RETURN a.id AS id, a.content AS content, a.domain AS domain,
-              a.weight AS weight, a.created_at AS created_at`,
+              a.weight AS weight, a.created_at AS created_at,
+              a.tenant_user_id AS tenant_user_id, a.tenant_org_id AS tenant_org_id,
+              a.folio_ids AS folio_ids, a.org_canon AS org_canon`,
       { params },
     );
 
@@ -288,6 +360,10 @@ async function anchorSearch(
       created_at: row.created_at as number,
       connections: [],
       strategies: new Set(["anchor"]),
+      ownerUserId: row.tenant_user_id as string | undefined,
+      orgId: row.tenant_org_id as string | undefined,
+      folioIds: (row.folio_ids as string[] | undefined) ?? undefined,
+      orgCanon: row.org_canon === true,
     }));
   } catch {
     return [];
@@ -401,10 +477,21 @@ export async function recall(
     }
   }
 
-  // Sort by score descending
-  const sorted = Array.from(merged.values()).sort(
-    (a, b) => b.score - a.score,
-  );
+  // Soft-bias foregrounding (Knowledge Architecture P1, grilled Q2): compute
+  // each result's provenance origin, then boost org-canon + active-workspace
+  // results so they rank higher WITHOUT excluding personal/shared content.
+  // Trust comes from the visible label, not from caging the other tiers.
+  const withOrigin = Array.from(merged.values()).map((r) => {
+    const origin = computeOrigin(r, filter);
+    return {
+      ...r,
+      origin,
+      score: Math.min(1.0, r.score + originBoost(origin)),
+    };
+  });
+
+  // Sort by (boosted) score descending
+  const sorted = withOrigin.sort((a, b) => b.score - a.score);
 
   // Enrich top results (up to 10) with provenance — tenant-scoped hydration.
   const topResults = sorted.slice(0, 10);
@@ -422,6 +509,7 @@ export async function recall(
     created_at: r.created_at,
     connections: r.connections,
     provenance: provenanceResults[i],
+    origin: r.origin,
   }));
 
   return {

@@ -62,6 +62,33 @@ function resolveCallerUserId(): string | undefined {
   );
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Knowledge Architecture P1 (2026-06-03) — active-place forwarding.
+//
+// The gobot daemon sets these per-turn env vars on the Claude Code subprocess
+// (alongside MOSSCAP_ACTOR_USER_ID), resolved from the caller's REAL
+// memberships (mimir-tenant-builder). The proxy inherits the env and forwards
+// them so the MCP recall path becomes place-aware — org canon surfaces +
+// in-workspace results foreground, each provenance-labeled. The daemon is the
+// trust boundary (it asserts only orgs/folios the user actually belongs to);
+// the Mimir service trusts the bearer-authed daemon, same as folio-ids.
+//
+//   MOSSCAP_ACTIVE_ORG        → X-Mimir-Active-Org (Convex organizations _id)
+//   MOSSCAP_ACTIVE_ORG_NAME   → X-Mimir-Active-Org-Name (for the canon label)
+//   MOSSCAP_ACTIVE_FOLIO_IDS  → X-Mimir-Active-Folio-Ids (active workspace boost)
+//   MOSSCAP_FOLIO_IDS         → X-Mimir-Folio-Ids (full accessible-folio list)
+// ───────────────────────────────────────────────────────────────────────────
+function applyPlaceHeaders(headers: Record<string, string>): void {
+  const activeOrg = process.env.MOSSCAP_ACTIVE_ORG;
+  if (activeOrg) headers["X-Mimir-Active-Org"] = activeOrg;
+  const activeOrgName = process.env.MOSSCAP_ACTIVE_ORG_NAME;
+  if (activeOrgName) headers["X-Mimir-Active-Org-Name"] = activeOrgName;
+  const activeFolioIds = process.env.MOSSCAP_ACTIVE_FOLIO_IDS;
+  if (activeFolioIds) headers["X-Mimir-Active-Folio-Ids"] = activeFolioIds;
+  const folioIds = process.env.MOSSCAP_FOLIO_IDS;
+  if (folioIds) headers["X-Mimir-Folio-Ids"] = folioIds;
+}
+
 function commonHeaders() {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -72,6 +99,7 @@ function commonHeaders() {
   }
   const userId = resolveCallerUserId();
   if (userId) headers["X-Mimir-User-Id"] = userId;
+  applyPlaceHeaders(headers);
   return headers;
 }
 
@@ -84,6 +112,7 @@ function readHeaders() {
   }
   const userId = resolveCallerUserId();
   if (userId) headers["X-Mimir-User-Id"] = userId;
+  applyPlaceHeaders(headers);
   return headers;
 }
 

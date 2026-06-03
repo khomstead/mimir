@@ -197,28 +197,49 @@ export function applyTenantFilter(
     [`${paramPrefix}_now`]: now,
   };
 
-  // Ownership clause: owner OR (folio-shared via folio_ids intersection).
-  let ownershipClause = `${variable}.tenant_user_id = $${paramPrefix}_userId`;
+  // Ownership clause: owner OR (folio-shared via folio_ids intersection)
+  // OR (org-canon readable by an active member). These are ADDITIVE read
+  // grants — each widens what the caller can see; none leaks another
+  // user's private content.
+  const ownershipParts = [`${variable}.tenant_user_id = $${paramPrefix}_userId`];
   if (filter.includeFolioIds && filter.includeFolioIds.length > 0) {
     params[`${paramPrefix}_folios`] = filter.includeFolioIds;
-    ownershipClause =
-      `(${variable}.tenant_user_id = $${paramPrefix}_userId ` +
-      `OR (${variable}.folio_ids IS NOT NULL AND any(f IN ${variable}.folio_ids WHERE f IN $${paramPrefix}_folios)))`;
+    ownershipParts.push(
+      `(${variable}.folio_ids IS NOT NULL AND any(f IN ${variable}.folio_ids WHERE f IN $${paramPrefix}_folios))`,
+    );
   }
+  // Additive org-canon read grant (Knowledge Architecture P1, 2026-06-03):
+  // when the caller asserts an active org scope (daemon resolves the
+  // caller's REAL memberships before setting it — see mimir-tenant-builder),
+  // org-canon nodes stamped with that org become readable even though
+  // they're owned by another member. `org_canon = true` is the gate, so an
+  // ordinary org-context note (tenant_org_id set, org_canon absent) does
+  // NOT surface cross-member.
+  if (filter.activeOrgScope) {
+    params[`${paramPrefix}_orgScope`] = filter.activeOrgScope;
+    ownershipParts.push(
+      `(${variable}.tenant_org_id = $${paramPrefix}_orgScope AND ${variable}.org_canon = true)`,
+    );
+  }
+  const ownershipClause =
+    ownershipParts.length === 1
+      ? ownershipParts[0]
+      : `(${ownershipParts.join(" OR ")})`;
 
   // Forget-cascade visibility: a node marked tenant_invisible_after a
   // past time is invisible. Null means visible.
   const invisibilityClause = `(${variable}.tenant_invisible_after IS NULL OR ${variable}.tenant_invisible_after > $${paramPrefix}_now)`;
 
-  // Optional org-scope filter.
-  let orgClause = "";
-  if (filter.activeOrgScope) {
-    params[`${paramPrefix}_orgScope`] = filter.activeOrgScope;
-    orgClause = ` AND (${variable}.tenant_org_id = $${paramPrefix}_orgScope OR ${variable}.tenant_org_id IS NULL)`;
-  }
+  // NOTE: the former restrictive org-scope clause (AND tenant_org_id =
+  // orgScope OR NULL) was REMOVED in Knowledge Architecture P1. It was a
+  // firewall that excluded the caller's OWN content tagged with a different
+  // org — the "caged colleague" anti-pattern (grilled Q2). Org scope is now
+  // a soft-bias signal (boost in the recall verb + the additive grant
+  // above), never a hard exclusion. Cross-USER isolation is preserved by
+  // the ownership clause; org scope only ever WIDENS visibility now.
 
   return {
-    fragment: `(${ownershipClause}) AND ${invisibilityClause}${orgClause}`,
+    fragment: `(${ownershipClause}) AND ${invisibilityClause}`,
     params,
   };
 }
@@ -368,6 +389,14 @@ export async function createNode(
     if (tenant.organizationId) tenantProps.tenant_org_id = tenant.organizationId;
     if (tenant.folioIds && tenant.folioIds.length > 0) {
       tenantProps.folio_ids = tenant.folioIds;
+    }
+    // Org-canon marker (Knowledge Architecture P1) — only the Convex
+    // knowledge bridge sets this (entryVisibility:"org" promotions). It is
+    // what flips a node from "owner-only / folio-shared" to "readable by
+    // any member of tenant_org_id" via the additive grant in
+    // applyTenantFilter + vectorSearch. Requires tenant_org_id to matter.
+    if (tenant.orgCanon && tenant.organizationId) {
+      tenantProps.org_canon = true;
     }
   }
   const allProps = { id, ...tenantProps, ...props };
@@ -521,7 +550,16 @@ export async function vectorSearch(
   queryEmbedding: number[],
   k: number,
   filter: TenantFilter,
-): Promise<Array<{ id: string; content: string; score: number; created_at: number }>> {
+): Promise<Array<{
+  id: string;
+  content: string;
+  score: number;
+  created_at: number;
+  tenant_user_id?: string;
+  tenant_org_id?: string;
+  folio_ids?: string[];
+  org_canon?: boolean;
+}>> {
   const g = getGraph();
 
   if (!filter || !filter.callerUserId) {
@@ -555,6 +593,7 @@ export async function vectorSearch(
             node.tenant_user_id AS tenant_user_id,
             node.tenant_org_id AS tenant_org_id,
             node.folio_ids AS folio_ids,
+            node.org_canon AS org_canon,
             node.tenant_invisible_after AS tenant_invisible_after
      ORDER BY score ASC`,
     { params: { k: overFetchK, embedding: queryEmbedding } }
@@ -564,11 +603,21 @@ export async function vectorSearch(
     return [];
   }
 
-  const filtered: Array<{ id: string; content: string; score: number; created_at: number }> = [];
+  const filtered: Array<{
+    id: string;
+    content: string;
+    score: number;
+    created_at: number;
+    tenant_user_id?: string;
+    tenant_org_id?: string;
+    folio_ids?: string[];
+    org_canon?: boolean;
+  }> = [];
   for (const r of result.data as Record<string, unknown>[]) {
     const ownerUserId = r.tenant_user_id as string | undefined;
     const folioIds = (r.folio_ids as string[] | undefined) ?? [];
     const orgId = r.tenant_org_id as string | undefined;
+    const orgCanon = r.org_canon === true;
     const invisibleAfter = r.tenant_invisible_after as number | undefined;
     // Reject untagged legacy nodes — Phase 1E expects backfill before recall flows.
     if (!ownerUserId) continue;
@@ -576,19 +625,26 @@ export async function vectorSearch(
     if (invisibleAfter !== undefined && invisibleAfter !== null && invisibleAfter <= now) {
       continue;
     }
-    // Ownership: caller owns it, OR caller has folio access.
+    // Additive read grants (must mirror applyTenantFilter): caller owns it,
+    // OR has folio access, OR it's org-canon for the caller's active org.
+    // Knowledge Architecture P1 (2026-06-03): the former restrictive
+    // org-firewall (`orgScope && orgId !== orgScope → exclude`) was removed
+    // — org scope only WIDENS now; cross-user isolation stays on ownership.
     const ownedByCaller = ownerUserId === filter.callerUserId;
     const folioShared =
       allowedFolios.length > 0 &&
       folioIds.some((f) => allowedFolios.includes(f));
-    if (!ownedByCaller && !folioShared) continue;
-    // Org scope: filter to matching org or untagged-org legacy.
-    if (orgScope && orgId && orgId !== orgScope) continue;
+    const orgCanonReadable = !!orgScope && orgId === orgScope && orgCanon;
+    if (!ownedByCaller && !folioShared && !orgCanonReadable) continue;
     filtered.push({
       id: r.id as string,
       content: r.content as string,
       score: r.score as number,
       created_at: r.created_at as number,
+      tenant_user_id: ownerUserId,
+      tenant_org_id: orgId,
+      folio_ids: folioIds,
+      org_canon: orgCanon,
     });
     if (filtered.length >= k) break;
   }

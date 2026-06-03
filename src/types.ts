@@ -38,6 +38,16 @@ export interface TenantStamp {
   organizationId?: string;
   /** Optional folio context (array of Convex `mosscap_folios` _ids). */
   folioIds?: string[];
+  /**
+   * Org-canon marker (Knowledge Architecture P1, 2026-06-03). When true,
+   * the node is stamped `org_canon: true` so that ANY active member of
+   * `organizationId` may recall it (the additive org-canon read grant in
+   * applyTenantFilter / vectorSearch), not just the promoter. Set ONLY by
+   * the Convex knowledge bridge for entryVisibility:"org" promotions —
+   * never on ordinary org-context retains, which would leak private notes
+   * to co-members. Requires `organizationId` to be set to have any effect.
+   */
+  orgCanon?: boolean;
 }
 
 /**
@@ -73,8 +83,36 @@ export interface TenantFilter {
   callerUserId: string;
   /** Folios the caller has access to (own + shared). May be empty. */
   includeFolioIds?: string[];
-  /** Active org scope from `mosscap_sessions.activeOrgScope`. Null = no org filter. */
+  /**
+   * Active org scope from `mosscap_sessions.activeOrgScope`. Knowledge
+   * Architecture P1 (2026-06-03) repurposed this from a FIREWALL into a
+   * SOFT-BIAS signal (grilled Q2: "a caged colleague breeds distrust").
+   * When set it does TWO things — neither of which excludes the caller's
+   * own content:
+   *   1. UNLOCKS the additive org-canon read grant: nodes with
+   *      `tenant_org_id = activeOrgScope AND org_canon = true` become
+   *      readable even though they're owned by another member.
+   *   2. BOOSTS (in the recall verb) org-canon + active-workspace results
+   *      so they foreground — personal notes still surface, just lower.
+   * It no longer hard-filters out other-org content (that firewall caged
+   * the caller's own cross-org knowledge). The ownership clause remains
+   * the structural cross-USER isolation boundary.
+   */
   activeOrgScope?: string;
+  /**
+   * Active folio (the workspace the turn is happening in), if any. Subset
+   * signal of includeFolioIds used by the recall verb to BOOST in-workspace
+   * results (provenance tier "workspace"). Distinct from includeFolioIds
+   * (the full access list — what's VISIBLE vs what's FOREGROUNDED).
+   */
+  activeFolioIds?: string[];
+  /**
+   * Human-readable name of the active org, for the provenance label
+   * ("<activeOrgName> canon"). Optional — falls back to "Org canon" when
+   * absent. Carried so recall output is self-describing without a Convex
+   * round-trip.
+   */
+  activeOrgName?: string;
 }
 
 // ─── Node Types ──────────────────────────────────────────────
@@ -330,6 +368,27 @@ export interface TriageResponse {
   action_required: boolean;
 }
 
+/**
+ * Provenance origin of a recall result (Knowledge Architecture P1).
+ * Trust comes from VISIBLE sourcing, not from caging content (grilled Q2):
+ * every cross-context result is labeled so the user knows where it came from.
+ */
+export interface RecallOrigin {
+  /**
+   *   - "org_canon" — distilled org canon (org_canon node, matched the
+   *     caller's activeOrgScope). Boosted + labeled "<Org> canon".
+   *   - "workspace" — content from the active workspace (folio match).
+   *   - "shared"    — folio-shared content the caller can read but not the
+   *     active workspace.
+   *   - "personal"  — the caller's own un-shared content (baseline).
+   */
+  tier: "org_canon" | "workspace" | "shared" | "personal";
+  /** Human-readable provenance label, e.g. "LightWorks Collective canon". */
+  label: string;
+  orgId?: string;
+  folioIds?: string[];
+}
+
 export interface RecallResult {
   id: string;
   content: string;
@@ -339,6 +398,13 @@ export interface RecallResult {
   created_at: number;
   connections: string[];
   provenance: string | null;
+  /**
+   * Provenance origin (Knowledge Architecture P1, 2026-06-03). Present when
+   * the node carries tenant stamps (Thought/Episode/Anchor from recall
+   * strategies). Lets the caller render "this workspace" / "your personal
+   * note" / "<Org> canon" chips without a second query.
+   */
+  origin?: RecallOrigin;
 }
 
 export interface RecallResponse {

@@ -594,11 +594,17 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     // ── Phase 3: Active anchors (caller's tenant only) ──
+    // Interim LIMIT 12 (was 5): a query-independent first-N cap silently
+    // dropped anchors once a tenant has >5 (e.g. the manifesto's 6–8
+    // Lighthouse pedagogy anchors). 12 covers near-term need. The proper
+    // fix — relevance-rank anchors to the turn query (needs anchor
+    // embeddings) + an org-canon grant so org anchors surface for members —
+    // is bundled into the P3 anchor overhaul.
     const anchorsResult = await g.query(
       `MATCH (a:Anchor)
        WHERE a.weight > 0
          AND a.tenant_user_id = $callerUserId
-       RETURN a.content AS c, a.domain AS d LIMIT 5`,
+       RETURN a.content AS c, a.domain AS d LIMIT 12`,
       { params: { callerUserId: filter.callerUserId } },
     );
 

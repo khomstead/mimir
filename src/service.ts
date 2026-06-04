@@ -22,6 +22,7 @@ import { triage } from "./verbs/triage.js";
 import { processQueue } from "./verbs/process-queue.js";
 import { forget, forgetByShareRevocation } from "./verbs/forget.js";
 import { explainEpisode } from "./verbs/explain-episode.js";
+import { generateEmbedding } from "./embeddings.js";
 import type { TenantStamp, TenantFilter } from "./types.js";
 
 const DATA_PATH =
@@ -268,6 +269,44 @@ async function handleRequest(req: Request): Promise<Response> {
     const intent = intentRaw && validIntents.has(intentRaw) ? intentRaw as any : undefined;
     const result = await recall(query, filterResult.filter, scope, timeRange, asOf, intent);
     return jsonResponse(result);
+  }
+
+  // ── Embed-batch (POST /api/embed-batch) ──
+  // Pure embedding passthrough to the configured backend (oMLX). Used by
+  // callers that can't reach the embedder directly (e.g. Convex cloud → the
+  // localhost-only oMLX) and need to compute their OWN similarities over a
+  // KNOWN small set — e.g. knowledge-board semantic discovery, which is an
+  // N×N pairwise problem over a board's nuggets, NOT a brain-wide recall (recall
+  // saturates the top-k with duplicate copies of the query nugget, crowding out
+  // the genuinely-related ones). Bearer-gated (the global gate above); no tenant
+  // scope needed — the caller already holds the text it sends, so this reads
+  // nothing from the graph.
+  if (path === "/api/embed-batch" && req.method === "POST") {
+    const body = await req.json().catch(() => null);
+    const texts: unknown = body?.texts;
+    if (!Array.isArray(texts) || texts.length === 0) {
+      return errorResponse("Missing texts: string[]");
+    }
+    if (texts.length > 256) {
+      return errorResponse("Too many texts (max 256)");
+    }
+    if (!texts.every((t) => typeof t === "string")) {
+      return errorResponse("texts must all be strings");
+    }
+    try {
+      // Sequential to respect oMLX's single-stream embedder + its keep-alive
+      // socket quirk (Connection: close per request, see embeddings.ts).
+      const vectors: number[][] = [];
+      for (const t of texts as string[]) {
+        vectors.push(await generateEmbedding(t));
+      }
+      return jsonResponse({ vectors, dim: vectors[0]?.length ?? 0 });
+    } catch (err) {
+      return errorResponse(
+        `Embedding failed: ${(err as Error).message}`,
+        502,
+      );
+    }
   }
 
   // ── Retain (POST /api/retain) ──

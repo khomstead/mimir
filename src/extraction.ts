@@ -422,19 +422,41 @@ export async function extractFromText(
     return deferredExtraction();
   }
 
-  const apiKey = getAnthropicKey();
+  // Model-agnostic backend seam (cost realization). MIMIR_EXTRACTION_BACKEND=omlx
+  // routes the GENERATIVE extraction call to the local oMLX server (Anthropic-
+  // compatible /v1/messages) at $0, leaving ANTHROPIC_API_KEY unused. Extraction
+  // emits entity/relation JSON — it needs an INSTRUCT model (gemma/qwen), never
+  // the embedding model. Anything other than "omlx" keeps the metered cloud path.
+  const useOmlx = process.env.MIMIR_EXTRACTION_BACKEND === "omlx";
 
-  if (!apiKey) {
-    console.error("[mimir:extraction] No ANTHROPIC_API_KEY — deferring extraction (queue pattern)");
-    return deferredExtraction();
+  let apiKey: string | undefined;
+  let baseURL: string | undefined;
+  if (useOmlx) {
+    apiKey = process.env.OMLX_API_KEY;
+    baseURL = process.env.OMLX_BASE_URL;
+    if (!apiKey || !baseURL) {
+      console.error(
+        "[mimir:extraction] MIMIR_EXTRACTION_BACKEND=omlx but OMLX_BASE_URL/OMLX_API_KEY unset — deferring",
+      );
+      return deferredExtraction();
+    }
+  } else {
+    apiKey = getAnthropicKey();
+    if (!apiKey) {
+      console.error("[mimir:extraction] No ANTHROPIC_API_KEY — deferring extraction (queue pattern)");
+      return deferredExtraction();
+    }
   }
-  console.error(`[mimir:extraction] Using LLM model: ${process.env.MIMIR_EXTRACTION_MODEL ?? DEFAULT_MODEL}`);
 
   const model =
-    process.env.MIMIR_EXTRACTION_MODEL ?? DEFAULT_MODEL;
+    process.env.MIMIR_EXTRACTION_MODEL ??
+    (useOmlx ? "gemma-4-26b-a4b-it-4bit" : DEFAULT_MODEL);
+  console.error(
+    `[mimir:extraction] Using ${useOmlx ? "oMLX (local, $0)" : "Anthropic (metered)"} model: ${model}`,
+  );
 
   try {
-    const client = new Anthropic({ apiKey });
+    const client = new Anthropic(baseURL ? { apiKey, baseURL } : { apiKey });
 
     // Fetch existing entity context so the LLM can decide ADD vs UPDATE.
     // Phase 1E: scoped to caller's tenant if provided. If no filter is

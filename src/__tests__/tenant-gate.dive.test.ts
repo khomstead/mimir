@@ -9,13 +9,22 @@
  * never the live graph. All records are synthetic and benign; all
  * assertions are POSITIVE isolation assertions.
  *
- * Two service configurations:
- *   ENFORCED  (MIMIR_REQUIRE_TENANT_HEADER=true, no default-user fallback)
- *     — the post-cutover fail-closed posture September requires.
- *   CUTOVER   (gate=false, GOBOT_DEFAULT_USER_ID set)
- *     — today's production posture; demonstrates, as run evidence, the
- *       caller-census finding: a missing per-user id is silently stamped
- *       to the default user (mis-attribution, not a 401).
+ * Two service configurations (Identity Session 2, 2026-07-02 — the
+ * cutover fallback is DELETED from service.ts, so both must fail closed):
+ *   ENFORCED    (MIMIR_REQUIRE_TENANT_HEADER=true, no default-user set)
+ *     — the fail-closed posture September requires.
+ *   LEGACY-ENV  (gate=false, GOBOT_DEFAULT_USER_ID set — the exact env
+ *     that used to re-arm the mis-stamp fallback)
+ *     — asserts the gate can no longer be re-armed by env flip: an
+ *       unattributed write 401s and lands in NO tenant. This scenario
+ *       previously (pre-Session-2) demonstrated the census mis-stamp
+ *       leak: the same request returned 200 and was silently stamped
+ *       into the default user's tenant.
+ *
+ * Also drives the REAL MCP proxy (src/proxy.ts) over stdio against the
+ * enforced service to pin the two surviving identity tiers (actor,
+ * explicit) + the fail-closed none tier and the X-Mimir-Id-Source
+ * telemetry.
  *
  * Also asserts at the HTTP layer that /api/context (the every-turn
  * prompt-injection path) resolves concept paraphrases via the semantic
@@ -30,12 +39,12 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 
 const SECRET = "dive-shared-secret";
 const ENFORCED_PORT = 4299;
-const CUTOVER_PORT = 4298;
+const LEGACY_ENV_PORT = 4298;
 const ENFORCED_URL = `http://localhost:${ENFORCED_PORT}`;
-const CUTOVER_URL = `http://localhost:${CUTOVER_PORT}`;
+const LEGACY_ENV_URL = `http://localhost:${LEGACY_ENV_PORT}`;
 
 let enforcedProc: ReturnType<typeof Bun.spawn> | null = null;
-let cutoverProc: ReturnType<typeof Bun.spawn> | null = null;
+let legacyEnvProc: ReturnType<typeof Bun.spawn> | null = null;
 
 async function waitHealthy(url: string, timeoutMs = 20_000): Promise<void> {
   const t0 = Date.now();
@@ -73,24 +82,28 @@ function spawnService(port: number, dataPath: string, extraEnv: Record<string, s
 const auth = { Authorization: `Bearer ${SECRET}` };
 const json = { "Content-Type": "application/json" };
 
-describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)", () => {
-  beforeAll(async () => {
-    enforcedProc = spawnService(ENFORCED_PORT, `/tmp/mimir-dive-gate-enforced-${Date.now()}`, {
-      MIMIR_REQUIRE_TENANT_HEADER: "true",
-      GOBOT_DEFAULT_USER_ID: "", // no fallback exists in the enforced posture
-    });
-    cutoverProc = spawnService(CUTOVER_PORT, `/tmp/mimir-dive-gate-cutover-${Date.now()}`, {
-      MIMIR_REQUIRE_TENANT_HEADER: "false",
-      GOBOT_DEFAULT_USER_ID: "user_default_kyle",
-    });
-    await Promise.all([waitHealthy(ENFORCED_URL), waitHealthy(CUTOVER_URL)]);
-  }, 60_000);
-
-  afterAll(async () => {
-    enforcedProc?.kill();
-    cutoverProc?.kill();
+// Module-scoped so both describe blocks (HTTP boundary + MCP proxy tiers)
+// share the same isolated service instances.
+beforeAll(async () => {
+  enforcedProc = spawnService(ENFORCED_PORT, `/tmp/mimir-dive-gate-enforced-${Date.now()}`, {
+    MIMIR_REQUIRE_TENANT_HEADER: "true",
+    GOBOT_DEFAULT_USER_ID: "", // no fallback exists in the enforced posture
   });
+  // The exact env combination that pre-Session-2 re-armed the mis-stamp
+  // fallback. Both vars are now inert — this instance must fail closed too.
+  legacyEnvProc = spawnService(LEGACY_ENV_PORT, `/tmp/mimir-dive-gate-legacy-env-${Date.now()}`, {
+    MIMIR_REQUIRE_TENANT_HEADER: "false",
+    GOBOT_DEFAULT_USER_ID: "user_default_kyle",
+  });
+  await Promise.all([waitHealthy(ENFORCED_URL), waitHealthy(LEGACY_ENV_URL)]);
+}, 60_000);
 
+afterAll(async () => {
+  enforcedProc?.kill();
+  legacyEnvProc?.kill();
+});
+
+describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)", () => {
   // ── ENFORCED (fail-closed) posture ─────────────────────────
 
   test("health is open; data endpoints are Bearer-gated", async () => {
@@ -187,11 +200,16 @@ describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)",
     expect(crossText).not.toContain("Light Cycle");  // tenant wall holds through recall()
   }, 60_000);
 
-  // ── CUTOVER (today's production) posture ───────────────────
+  // ── LEGACY-ENV posture (Identity Session 2 flip) ───────────
+  // Pre-Session-2 this scenario DEMONSTRATED the leak: the unattributed
+  // write returned 200 and was silently stamped into user_default_kyle's
+  // tenant. The fallback branch is now deleted from service.ts, so the
+  // same env + same request must 401 and write to NO tenant.
 
-  test("CUTOVER: missing X-Mimir-User-Id is silently stamped to the default user (the census mis-stamp, as run evidence)", async () => {
-    // A write with NO user header — today this does not 401…
-    const w = await fetch(`${CUTOVER_URL}/api/retain`, {
+  test("LEGACY-ENV: cutover env can no longer re-arm the fallback — unattributed write 401s and lands in NO tenant", async () => {
+    // A write with NO user header, against a service whose env still sets
+    // MIMIR_REQUIRE_TENANT_HEADER=false + GOBOT_DEFAULT_USER_ID.
+    const w = await fetch(`${LEGACY_ENV_URL}/api/retain`, {
       method: "POST",
       headers: { ...auth, ...json },
       body: JSON.stringify({
@@ -199,20 +217,205 @@ describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)",
         source: "chat",
       }),
     });
-    expect(w.status).toBe(200);
+    expect(w.status).toBe(401);
+    const wBody = (await w.json()) as { error: string };
+    expect(wBody.error).toContain("X-Mimir-User-Id");
 
-    // …and the record now belongs to the DEFAULT user's tenant.
-    const asDefault = await fetch(`${CUTOVER_URL}/api/recall?q=aquarium%20filter`, {
+    // Unattributed reads fail closed too.
+    const read = await fetch(`${LEGACY_ENV_URL}/api/recall?q=aquarium%20filter`, {
+      headers: auth,
+    });
+    expect(read.status).toBe(401);
+
+    // And nothing landed in the would-be default tenant.
+    const asDefault = await fetch(`${LEGACY_ENV_URL}/api/recall?q=aquarium%20filter`, {
+      headers: { ...auth, "X-Mimir-User-Id": "user_default_kyle" },
+    });
+    expect(asDefault.status).toBe(200);
+    const body = (await asDefault.json()) as { results: Array<{ content: string }> };
+    const misStamped = body.results.some((r) => r.content.includes("aquarium"));
+    console.error(
+      `[dive:Q5→S2] legacy cutover env: unattributed write status=${w.status}; ` +
+        `visible to default user = ${misStamped} (fail-closed holds)`,
+    );
+    expect(misStamped).toBe(false);
+  }, 60_000);
+});
+
+// ─── Identity Session 2 — the REAL MCP proxy over stdio ─────
+//
+// Drives src/proxy.ts as a subprocess (newline-delimited JSON-RPC, the
+// MCP stdio framing) against the ENFORCED service instance. Pins the two
+// surviving identity tiers, the fail-closed none tier (with the deleted
+// GOBOT_DEFAULT_USER_ID tier explicitly set in env to prove it stays
+// dead), and the X-Mimir-Id-Source stderr telemetry.
+
+type McpResult = {
+  result?: { content: Array<{ type: string; text: string }>; isError?: boolean };
+};
+
+async function mcpToolCall(
+  identityEnv: Record<string, string>,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<{ response: McpResult | null; stderr: string }> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) env[k] = v;
+  }
+  // Strip ALL identity tiers from the inherited env, then apply only the
+  // scenario's own — the whole point is controlling which tier resolves.
+  delete env.MOSSCAP_ACTOR_USER_ID;
+  delete env.MIMIR_USER_ID;
+  delete env.GOBOT_DEFAULT_USER_ID;
+  Object.assign(env, identityEnv, {
+    MIMIR_URL: ENFORCED_URL,
+    MIMIR_SHARED_SECRET: SECRET,
+  });
+
+  const proc = Bun.spawn(["bun", "run", "src/proxy.ts"], {
+    cwd: import.meta.dir + "/../..",
+    env,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const send = (obj: unknown) => proc.stdin.write(JSON.stringify(obj) + "\n");
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "identity-s2-test", version: "0.0.0" },
+    },
+  });
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: tool, arguments: args } });
+  proc.stdin.flush();
+
+  const decoder = new TextDecoder();
+  const reader = proc.stdout.getReader();
+  let buf = "";
+  let response: McpResult | null = null;
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline && response === null) {
+    const chunk = await Promise.race([
+      reader.read(),
+      new Promise<{ done: true; value: undefined }>((r) =>
+        setTimeout(() => r({ done: true, value: undefined }), deadline - Date.now()),
+      ),
+    ]);
+    if (chunk.done) break;
+    buf += decoder.decode(chunk.value);
+    for (const line of buf.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.id === 2) response = msg as McpResult;
+      } catch {
+        // partial line — keep buffering
+      }
+    }
+  }
+  proc.kill();
+  const stderr = await new Response(proc.stderr).text();
+  return { response, stderr };
+}
+
+describe("Identity Session 2 — MCP proxy identity tiers (fail-closed, telemetry)", () => {
+  test("none tier: unattributed MCP retain fails with an explicit 401 and writes to NO tenant (GOBOT_DEFAULT_USER_ID in env stays dead)", async () => {
+    const { response, stderr } = await mcpToolCall(
+      // The deleted tier's env var is deliberately SET — it must not resolve.
+      { GOBOT_DEFAULT_USER_ID: "user_default_kyle" },
+      "retain",
+      { content: "Orphaned synthetic note about the xylophone maintenance rota", source: "chat" },
+    );
+    expect(response).not.toBeNull();
+    expect(response!.result?.isError).toBe(true);
+    const text = response!.result!.content[0]!.text;
+    expect(text).toContain("401");
+    expect(text).toContain("X-Mimir-User-Id");
+    // Telemetry: the proxy logged the none tier.
+    expect(stderr).toContain("id-source=none");
+
+    // The write landed in NO tenant — not the would-be default user's.
+    const asDefault = await fetch(`${ENFORCED_URL}/api/recall?q=xylophone%20maintenance`, {
       headers: { ...auth, "X-Mimir-User-Id": "user_default_kyle" },
     });
     const body = (await asDefault.json()) as { results: Array<{ content: string }> };
-    const misStamped = body.results.some((r) => r.content.includes("aquarium"));
-    console.error(`[dive:Q5] cutover mis-stamp demonstrated: unattributed write visible to default user = ${misStamped}`);
-    expect(misStamped).toBe(true);
-    // This is the September blocker in one assertion: under the current
-    // posture, any caller that fails to thread the per-user id writes
-    // into the default user's (Kyle's) tenant instead of failing loudly.
-    // The flip to ENFORCED must land before minors arrive (census:
-    // remove fallback at proxy.resolveCallerUserId + this service gate).
+    expect(body.results.some((r) => r.content.includes("xylophone"))).toBe(false);
+    console.error(
+      `[identity-s2] proxy none tier: isError=${response!.result?.isError}; ` +
+        `default-tenant leak=${body.results.some((r) => r.content.includes("xylophone"))}`,
+    );
+  }, 60_000);
+
+  test("actor tier (daemon path): MOSSCAP_ACTOR_USER_ID resolves, retain lands in the actor's tenant", async () => {
+    const { response, stderr } = await mcpToolCall(
+      { MOSSCAP_ACTOR_USER_ID: "teacher_actor" },
+      "retain",
+      { content: "Actor-tier synthetic note about the terrarium humidity log", source: "voice" },
+    );
+    expect(response).not.toBeNull();
+    expect(response!.result?.isError).not.toBe(true);
+    expect(stderr).toContain("id-source=actor");
+
+    const own = await fetch(`${ENFORCED_URL}/api/recall?q=terrarium%20humidity`, {
+      headers: { ...auth, "X-Mimir-User-Id": "teacher_actor" },
+    });
+    const ownBody = (await own.json()) as { results: Array<{ content: string }> };
+    expect(ownBody.results.some((r) => r.content.includes("terrarium"))).toBe(true);
+
+    const cross = await fetch(`${ENFORCED_URL}/api/recall?q=terrarium%20humidity`, {
+      headers: { ...auth, "X-Mimir-User-Id": "student_b" },
+    });
+    const crossBody = (await cross.json()) as { results: Array<{ content: string }> };
+    expect(crossBody.results.some((r) => r.content.includes("terrarium"))).toBe(false);
+    console.error(
+      `[identity-s2] proxy actor tier: owner sees ${ownBody.results.length}, other tenant sees 0 matching`,
+    );
+  }, 60_000);
+
+  test("explicit tier (interactive path): MIMIR_USER_ID resolves, retain lands in the asserted tenant", async () => {
+    const { response, stderr } = await mcpToolCall(
+      { MIMIR_USER_ID: "user_interactive" },
+      "retain",
+      { content: "Explicit-tier synthetic note about the marimba practice schedule", source: "manual" },
+    );
+    expect(response).not.toBeNull();
+    expect(response!.result?.isError).not.toBe(true);
+    expect(stderr).toContain("id-source=explicit");
+
+    const own = await fetch(`${ENFORCED_URL}/api/recall?q=marimba%20practice`, {
+      headers: { ...auth, "X-Mimir-User-Id": "user_interactive" },
+    });
+    const ownBody = (await own.json()) as { results: Array<{ content: string }> };
+    expect(ownBody.results.some((r) => r.content.includes("marimba"))).toBe(true);
+    console.error(`[identity-s2] proxy explicit tier: owner sees ${ownBody.results.length}`);
+  }, 60_000);
+
+  test("actor tier outranks explicit when both are set (per-turn identity wins)", async () => {
+    const { response, stderr } = await mcpToolCall(
+      { MOSSCAP_ACTOR_USER_ID: "teacher_actor", MIMIR_USER_ID: "user_interactive" },
+      "retain",
+      { content: "Priority synthetic note about the sundial calibration walk", source: "chat" },
+    );
+    expect(response).not.toBeNull();
+    expect(response!.result?.isError).not.toBe(true);
+    expect(stderr).toContain("id-source=actor");
+
+    const asActor = await fetch(`${ENFORCED_URL}/api/recall?q=sundial%20calibration`, {
+      headers: { ...auth, "X-Mimir-User-Id": "teacher_actor" },
+    });
+    const actorBody = (await asActor.json()) as { results: Array<{ content: string }> };
+    expect(actorBody.results.some((r) => r.content.includes("sundial"))).toBe(true);
+
+    const asExplicit = await fetch(`${ENFORCED_URL}/api/recall?q=sundial%20calibration`, {
+      headers: { ...auth, "X-Mimir-User-Id": "user_interactive" },
+    });
+    const explicitBody = (await asExplicit.json()) as { results: Array<{ content: string }> };
+    expect(explicitBody.results.some((r) => r.content.includes("sundial"))).toBe(false);
   }, 60_000);
 });

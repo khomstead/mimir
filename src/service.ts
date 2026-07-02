@@ -50,25 +50,11 @@ if (REQUIRE_AUTH && !SHARED_SECRET) {
   );
 }
 
-// Phase 1E: tenant-header cutover gate.
-// When true: missing X-Mimir-User-Id → 401 (fail-closed).
-// When false (Phase 1E cutover window): missing header logs a warning and
-// defaults to GOBOT_DEFAULT_USER_ID. Lets gobot+Mimir deploys land
-// non-atomically (gobot ships header-passing → 24h verification → flip
-// this env to true). Defaults to FALSE for backward-compat on the
-// initial deploy; flip via launchd plist update.
-const REQUIRE_TENANT_HEADER =
-  (process.env.MIMIR_REQUIRE_TENANT_HEADER ?? "false").toLowerCase() === "true";
-const DEFAULT_TENANT_FALLBACK_USER_ID =
-  process.env.GOBOT_DEFAULT_USER_ID ?? "";
-if (!REQUIRE_TENANT_HEADER && !DEFAULT_TENANT_FALLBACK_USER_ID) {
-  console.error(
-    "[mimir] MIMIR_REQUIRE_TENANT_HEADER=false AND GOBOT_DEFAULT_USER_ID empty. " +
-    "Tenant-stamped writes from clients lacking X-Mimir-User-Id will fail. " +
-    "Set GOBOT_DEFAULT_USER_ID to Kyle's userId for the cutover window, " +
-    "or flip MIMIR_REQUIRE_TENANT_HEADER=true once gobot ships header-passing.",
-  );
-}
+// Phase 1E tenant gate — permanently ENFORCED (Identity Session 2, 2026-07-02).
+// Missing X-Mimir-User-Id → 401 fail-closed, unconditionally. The cutover-era
+// MIMIR_REQUIRE_TENANT_HEADER / GOBOT_DEFAULT_USER_ID env branch is deleted:
+// no env flip can re-arm a default-tenant fallback. An unattributed request
+// writes to NO tenant and reads from NO tenant.
 
 function constantTimeEqual(a: string, b: string): boolean {
   // timingSafeEqual requires equal-length buffers; pad/truncate to avoid an
@@ -109,8 +95,8 @@ function requireBearer(req: Request, path: string): Response | null {
  *   X-Mimir-Active-Org     Convex `organizations` _id (optional)
  *   X-Mimir-Folio-Ids      comma-separated `mosscap_folios` _ids (optional)
  *
- * Returns null if missing (caller path must decide whether to 401 or
- * fallback). Header parsing only — no validation against Convex; the
+ * Returns null userId if the header is missing (callers 401 fail-closed).
+ * Header parsing only — no validation against Convex; the
  * service trusts the gobot daemon (gated by Bearer auth) to send
  * legitimate IDs.
  */
@@ -143,57 +129,28 @@ function parseTenantHeaders(req: Request): {
 
 /**
  * Phase 1E: extract a TenantStamp for write paths (retain, anchor, etc.).
- * Returns a 401 Response if no userId is present AND the require gate is on.
- * Returns the TenantStamp if either the header is present, or the
- * fallback is enabled and a default userId exists.
+ * Missing X-Mimir-User-Id → 401 fail-closed, unconditionally (Identity
+ * Session 2: the cutover fallback branch is deleted, not just disabled).
  */
 function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Response } {
   const { userId, activeOrgScope, folioIds, orgCanon } = parseTenantHeaders(req);
 
-  if (userId) {
-    return {
-      stamp: {
-        userId,
-        organizationId: activeOrgScope,
-        folioIds: folioIds.length > 0 ? folioIds : undefined,
-        orgCanon: orgCanon || undefined,
-      },
-    };
-  }
-
-  // No userId header — apply cutover fallback if allowed.
-  if (REQUIRE_TENANT_HEADER) {
+  if (!userId) {
     return {
       denied: jsonResponse(
         {
           error:
             "Missing X-Mimir-User-Id header (Phase 1E tenant gate enforced). " +
-            "Every write must identify the caller's userId.",
+            "Every request must identify the caller's userId.",
         },
         401,
       ),
     };
   }
-  if (!DEFAULT_TENANT_FALLBACK_USER_ID) {
-    return {
-      denied: jsonResponse(
-        {
-          error:
-            "Missing X-Mimir-User-Id header and no GOBOT_DEFAULT_USER_ID fallback configured.",
-        },
-        401,
-      ),
-    };
-  }
-  // Cutover-window fallback: log once-per-request and use default user.
-  console.error(
-    `[mimir:tenant-gate] CUTOVER WARN: ${req.method} ${new URL(req.url).pathname} ` +
-    `missing X-Mimir-User-Id — falling back to GOBOT_DEFAULT_USER_ID. ` +
-    `Flip MIMIR_REQUIRE_TENANT_HEADER=true once gobot ships header-passing.`,
-  );
+
   return {
     stamp: {
-      userId: DEFAULT_TENANT_FALLBACK_USER_ID,
+      userId,
       organizationId: activeOrgScope,
       folioIds: folioIds.length > 0 ? folioIds : undefined,
       orgCanon: orgCanon || undefined,
@@ -203,7 +160,7 @@ function extractTenantStamp(req: Request): { stamp: TenantStamp } | { denied: Re
 
 /**
  * Phase 1E: extract a TenantFilter for read paths (recall, pulse, etc.).
- * Same cutover semantics as extractTenantStamp.
+ * Same fail-closed semantics as extractTenantStamp.
  */
 function extractTenantFilter(req: Request): { filter: TenantFilter } | { denied: Response } {
   const r = extractTenantStamp(req);
@@ -758,7 +715,7 @@ async function main() {
   console.log("  POST /api/forget-cascade  (Phase 1E share-revocation)");
   console.log("  GET  /api/episode/:id     (Phase B2 explain — entities + edges + crosslinks)");
   console.log(
-    `[mimir:phase-1e] tenant-header gate: ${REQUIRE_TENANT_HEADER ? "ENFORCED (fail-closed)" : "CUTOVER WINDOW (fallback to GOBOT_DEFAULT_USER_ID)"}`,
+    "[mimir:phase-1e] tenant-header gate: ENFORCED (fail-closed, no env-flip fallback)",
   );
 
   // ── Consolidation worker (dual-stream slow path) ────────────────────────

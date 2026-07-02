@@ -34,7 +34,7 @@ const OFFLINE_MSG =
 const MIMIR_BEARER = process.env.MIMIR_SHARED_SECRET ?? "";
 
 // ───────────────────────────────────────────────────────────────────────────
-// Sprint A.1 + F-04 — per-session tenant routing (catherine-prep-backend).
+// Sprint A.1 + F-04 + Identity Session 2 — per-session tenant routing.
 //
 // The gobot daemon sets `MOSSCAP_ACTOR_USER_ID` on the Claude Code
 // subprocess env before spawning. This stdio proxy inherits that env from
@@ -42,24 +42,45 @@ const MIMIR_BEARER = process.env.MIMIR_SHARED_SECRET ?? "";
 // it through as `X-Mimir-User-Id` to the Mimir HTTP service. Mimir's
 // Phase 1E tenant gate validates the header.
 //
-// Three env names checked in priority order (so the proxy works during
-// the Phase 1 cutover window AND for legacy single-tenant invocations):
+// Two env names checked in priority order — there is deliberately NO
+// default-user fallback (Identity Session 2, 2026-07-02: GOBOT_DEFAULT_USER_ID
+// tier removed). When neither is set, the proxy sends NO X-Mimir-User-Id
+// header and the service tenant gate 401s: an unattributed call fails
+// closed instead of being silently mis-stamped into the default tenant.
 //   1. MOSSCAP_ACTOR_USER_ID  — set per turn by the daemon (Sprint A.1)
-//   2. MIMIR_USER_ID          — daemon-wide legacy override
-//   3. GOBOT_DEFAULT_USER_ID  — Phase 1 cutover fallback (Kyle)
+//   2. MIMIR_USER_ID          — deliberate single-user assertion (interactive)
+//
+// Telemetry: every request carries `X-Mimir-Id-Source: actor|explicit|none`
+// and the resolved tier is logged to stderr, so a fallback regression is
+// visible in both service request logs and MCP proxy logs.
 //
 // Privacy clause 13 (proposal v2.2 §11.5): "X-Mimir-User-Id MUST be set
 // to the calling user's userId, sourced from mosscap_sessions.userId —
 // never the daemon's identity." This proxy now honors that contract.
 // ───────────────────────────────────────────────────────────────────────────
 
-function resolveCallerUserId(): string | undefined {
-  return (
-    process.env.MOSSCAP_ACTOR_USER_ID ||
-    process.env.MIMIR_USER_ID ||
-    process.env.GOBOT_DEFAULT_USER_ID ||
-    undefined
-  );
+type CallerIdSource = "actor" | "explicit" | "none";
+
+function resolveCallerIdentity(): { userId: string | undefined; source: CallerIdSource } {
+  const actor = process.env.MOSSCAP_ACTOR_USER_ID;
+  if (actor) return { userId: actor, source: "actor" };
+  const explicit = process.env.MIMIR_USER_ID;
+  if (explicit) return { userId: explicit, source: "explicit" };
+  return { userId: undefined, source: "none" };
+}
+
+function applyIdentityHeaders(headers: Record<string, string>): void {
+  const { userId, source } = resolveCallerIdentity();
+  headers["X-Mimir-Id-Source"] = source;
+  if (userId) {
+    headers["X-Mimir-User-Id"] = userId;
+    console.error(`[mimir-proxy] id-source=${source}`);
+  } else {
+    console.error(
+      "[mimir-proxy] id-source=none — neither MOSSCAP_ACTOR_USER_ID nor MIMIR_USER_ID " +
+        "is set; sending no X-Mimir-User-Id (service tenant gate will 401 fail-closed)",
+    );
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -97,8 +118,7 @@ function commonHeaders() {
   if (MIMIR_BEARER) {
     headers["Authorization"] = `Bearer ${MIMIR_BEARER}`;
   }
-  const userId = resolveCallerUserId();
-  if (userId) headers["X-Mimir-User-Id"] = userId;
+  applyIdentityHeaders(headers);
   applyPlaceHeaders(headers);
   return headers;
 }
@@ -110,8 +130,7 @@ function readHeaders() {
   if (MIMIR_BEARER) {
     headers["Authorization"] = `Bearer ${MIMIR_BEARER}`;
   }
-  const userId = resolveCallerUserId();
-  if (userId) headers["X-Mimir-User-Id"] = userId;
+  applyIdentityHeaders(headers);
   applyPlaceHeaders(headers);
   return headers;
 }

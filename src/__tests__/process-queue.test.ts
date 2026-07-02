@@ -20,7 +20,7 @@ describe("processQueue", () => {
 
     const tId = await createNode("Thought", {
       content: "Kyle discussed the school project with Catherine",
-      embedding: new Array(1536).fill(0),
+      embedding: new Array(1024).fill(0),
       source: "chat",
       confidence: 0,
       created_at: Date.now(),

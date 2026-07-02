@@ -24,7 +24,7 @@ describe("pulse verb", () => {
 
     const thoughtId = await createNode("Thought", {
       content: "Trust is foundational to the school project",
-      embedding: new Array(1536).fill(0),
+      embedding: new Array(1024).fill(0),
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),

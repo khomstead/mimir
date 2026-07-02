@@ -22,7 +22,7 @@ describe("triage verb", () => {
 
     const thoughtId = await createNode("Thought", {
       content: "Catherine and I discussed curriculum updates",
-      embedding: new Array(1536).fill(0),
+      embedding: new Array(1024).fill(0),
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),

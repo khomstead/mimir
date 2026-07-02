@@ -95,7 +95,7 @@ describe("Phase 1E tenant isolation (FAIL-CLOSED contracts)", () => {
 
   test("A. cross-tenant Thought vector search returns empty", async () => {
     // Alice creates a Thought with a stub embedding.
-    const stubEmbedding = new Array(1536).fill(0.1);
+    const stubEmbedding = new Array(1024).fill(0.1);
     await createNode("Thought", {
       content: "Alice's private insight about Phoenix",
       embedding: stubEmbedding,
@@ -161,7 +161,7 @@ describe("Phase 1E tenant isolation (FAIL-CLOSED contracts)", () => {
     // realistic recall path.)
     const aliceThoughtId = await createNode("Thought", {
       content: "Thought derived from Phoenix notes",
-      embedding: new Array(1536).fill(0.2),
+      embedding: new Array(1024).fill(0.2),
       source: "chat",
       confidence: 0.9,
       created_at: Date.now(),
@@ -313,7 +313,7 @@ describe("Phase 1E tenant isolation (FAIL-CLOSED contracts)", () => {
   test("F. vectorSearch without filter throws", async () => {
     await expect(
       // @ts-expect-error — intentional missing arg
-      vectorSearch(new Array(1536).fill(0.0), 5),
+      vectorSearch(new Array(1024).fill(0.0), 5),
     ).rejects.toThrow(/TenantFilter|callerUserId/);
   });
 
@@ -337,7 +337,7 @@ describe("Phase 1E tenant isolation (FAIL-CLOSED contracts)", () => {
       createNode("Entity", { name: "X", type: "concept", summary: "x", synonyms: [], created_at: 0, updated_at: 0 }),
     ).rejects.toThrow(/tenant stamp required/);
     await expect(
-      createNode("Thought", { content: "x", embedding: new Array(1536).fill(0), source: "manual", confidence: 0, created_at: 0 }),
+      createNode("Thought", { content: "x", embedding: new Array(1024).fill(0), source: "manual", confidence: 0, created_at: 0 }),
     ).rejects.toThrow(/tenant stamp required/);
   });
 

@@ -30,7 +30,7 @@ describe("reflect verb", () => {
 
     const t1 = await createNode("Thought", {
       content: "Trust is the foundation of everything we build",
-      embedding: new Array(1536).fill(0),
+      embedding: new Array(1024).fill(0),
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),
@@ -38,7 +38,7 @@ describe("reflect verb", () => {
 
     const t2 = await createNode("Thought", {
       content: "Trust requires vulnerability and consistency",
-      embedding: new Array(1536).fill(0),
+      embedding: new Array(1024).fill(0),
       source: "chat",
       confidence: 0.8,
       created_at: Date.now(),

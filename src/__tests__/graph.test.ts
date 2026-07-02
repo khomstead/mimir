@@ -59,7 +59,7 @@ describe("graph", () => {
   });
 
   it("creates a Thought node", async () => {
-    const embedding = Array.from({ length: 1536 }, () => Math.random());
+    const embedding = Array.from({ length: 1024 }, () => Math.random());
     const id = await createNode("Thought", {
       content: "The brain MCP server should use FalkorDBLite for persistence",
       embedding,
@@ -95,8 +95,8 @@ describe("graph", () => {
   });
 
   it("vectorSearch returns similar thoughts ranked by score", async () => {
-    const closeEmbedding = Array.from({ length: 1536 }, (_, i) => (i === 0 ? 1.0 : 0.0));
-    const farEmbedding = Array.from({ length: 1536 }, (_, i) => (i === 500 ? 1.0 : 0.0));
+    const closeEmbedding = Array.from({ length: 1024 }, (_, i) => (i === 0 ? 1.0 : 0.0));
+    const farEmbedding = Array.from({ length: 1024 }, (_, i) => (i === 500 ? 1.0 : 0.0));
 
     await createNode("Thought", {
       content: "Close thought about trust",
@@ -113,7 +113,7 @@ describe("graph", () => {
       created_at: Date.now(),
     }, TEST_TENANT);
 
-    const queryVec = Array.from({ length: 1536 }, (_, i) => (i === 0 ? 0.9 : 0.05));
+    const queryVec = Array.from({ length: 1024 }, (_, i) => (i === 0 ? 0.9 : 0.05));
     const results = await vectorSearch(queryVec, 5, TEST_FILTER);
 
     expect(results.length).toBeGreaterThanOrEqual(2);

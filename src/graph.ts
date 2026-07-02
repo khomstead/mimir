@@ -578,78 +578,94 @@ export async function vectorSearch(
   //  2. Tenant filtering happens AFTER the index call (db.idx.vector.queryNodes
   //     has no pre-filter), so the caller's relevant nodes can sit past a small
   //     candidate window when other tenants' content crowds the top.
-  // Cost is negligible at this scale (k=1000 ≈ 15ms), and the cap bounds it as
-  // the graph grows. Take top-k AFTER tenant filtering below.
-  const overFetchK = Math.min(Math.max(k * 20, 256), 1000);
+  //
+  // The window ESCALATES (Q2 crowding-cliff fix, 2026-07-02): a fixed window
+  // silently returned ZERO of the caller's own top-k once ~window other-tenant
+  // vectors sat closer to the query — the normal regime at classroom scale
+  // (30 students writing near-duplicate notes on shared topics). So: fetch,
+  // tenant-filter, and if fewer than k survivors remain, retry with a 4×
+  // wider window until k survivors are collected or the index is exhausted
+  // (returned < requested ⇒ no more candidates). Latency grows with crowding;
+  // correctness never degrades. The durable fix (per-tenant graphs / filtered
+  // ANN) is a separate Phase-1G-shaped decision.
   const allowedFolios = filter.includeFolioIds ?? [];
   const orgScope = filter.activeOrgScope ?? null;
   const now = Date.now();
 
-  const result = await g.query(
-    `CALL db.idx.vector.queryNodes('Thought', 'embedding', $k, vecf32($embedding))
-     YIELD node, score
-     RETURN node.id AS id, node.content AS content, score,
-            node.created_at AS created_at,
-            node.tenant_user_id AS tenant_user_id,
-            node.tenant_org_id AS tenant_org_id,
-            node.folio_ids AS folio_ids,
-            node.org_canon AS org_canon,
-            node.tenant_invisible_after AS tenant_invisible_after
-     ORDER BY score ASC`,
-    { params: { k: overFetchK, embedding: queryEmbedding } }
-  );
+  let fetchK = Math.min(Math.max(k * 20, 256), 1000);
+  for (;;) {
+    const result = await g.query(
+      `CALL db.idx.vector.queryNodes('Thought', 'embedding', $k, vecf32($embedding))
+       YIELD node, score
+       RETURN node.id AS id, node.content AS content, score,
+              node.created_at AS created_at,
+              node.tenant_user_id AS tenant_user_id,
+              node.tenant_org_id AS tenant_org_id,
+              node.folio_ids AS folio_ids,
+              node.org_canon AS org_canon,
+              node.tenant_invisible_after AS tenant_invisible_after
+       ORDER BY score ASC`,
+      { params: { k: fetchK, embedding: queryEmbedding } }
+    );
 
-  if (!result.data || result.data.length === 0) {
-    return [];
-  }
-
-  const filtered: Array<{
-    id: string;
-    content: string;
-    score: number;
-    created_at: number;
-    tenant_user_id?: string;
-    tenant_org_id?: string;
-    folio_ids?: string[];
-    org_canon?: boolean;
-  }> = [];
-  for (const r of result.data as Record<string, unknown>[]) {
-    const ownerUserId = r.tenant_user_id as string | undefined;
-    const folioIds = (r.folio_ids as string[] | undefined) ?? [];
-    const orgId = r.tenant_org_id as string | undefined;
-    const orgCanon = r.org_canon === true;
-    const invisibleAfter = r.tenant_invisible_after as number | undefined;
-    // Reject untagged legacy nodes — Phase 1E expects backfill before recall flows.
-    if (!ownerUserId) continue;
-    // Forget-cascade: skip nodes marked invisible.
-    if (invisibleAfter !== undefined && invisibleAfter !== null && invisibleAfter <= now) {
-      continue;
+    const rows = (result.data ?? []) as Record<string, unknown>[];
+    if (rows.length === 0) {
+      return [];
     }
-    // Additive read grants (must mirror applyTenantFilter): caller owns it,
-    // OR has folio access, OR it's org-canon for the caller's active org.
-    // Knowledge Architecture P1 (2026-06-03): the former restrictive
-    // org-firewall (`orgScope && orgId !== orgScope → exclude`) was removed
-    // — org scope only WIDENS now; cross-user isolation stays on ownership.
-    const ownedByCaller = ownerUserId === filter.callerUserId;
-    const folioShared =
-      allowedFolios.length > 0 &&
-      folioIds.some((f) => allowedFolios.includes(f));
-    const orgCanonReadable = !!orgScope && orgId === orgScope && orgCanon;
-    if (!ownedByCaller && !folioShared && !orgCanonReadable) continue;
-    filtered.push({
-      id: r.id as string,
-      content: r.content as string,
-      score: r.score as number,
-      created_at: r.created_at as number,
-      tenant_user_id: ownerUserId,
-      tenant_org_id: orgId,
-      folio_ids: folioIds,
-      org_canon: orgCanon,
-    });
-    if (filtered.length >= k) break;
-  }
 
-  return filtered;
+    const filtered: Array<{
+      id: string;
+      content: string;
+      score: number;
+      created_at: number;
+      tenant_user_id?: string;
+      tenant_org_id?: string;
+      folio_ids?: string[];
+      org_canon?: boolean;
+    }> = [];
+    for (const r of rows) {
+      const ownerUserId = r.tenant_user_id as string | undefined;
+      const folioIds = (r.folio_ids as string[] | undefined) ?? [];
+      const orgId = r.tenant_org_id as string | undefined;
+      const orgCanon = r.org_canon === true;
+      const invisibleAfter = r.tenant_invisible_after as number | undefined;
+      // Reject untagged legacy nodes — Phase 1E expects backfill before recall flows.
+      if (!ownerUserId) continue;
+      // Forget-cascade: skip nodes marked invisible.
+      if (invisibleAfter !== undefined && invisibleAfter !== null && invisibleAfter <= now) {
+        continue;
+      }
+      // Additive read grants (must mirror applyTenantFilter): caller owns it,
+      // OR has folio access, OR it's org-canon for the caller's active org.
+      // Knowledge Architecture P1 (2026-06-03): the former restrictive
+      // org-firewall (`orgScope && orgId !== orgScope → exclude`) was removed
+      // — org scope only WIDENS now; cross-user isolation stays on ownership.
+      const ownedByCaller = ownerUserId === filter.callerUserId;
+      const folioShared =
+        allowedFolios.length > 0 &&
+        folioIds.some((f) => allowedFolios.includes(f));
+      const orgCanonReadable = !!orgScope && orgId === orgScope && orgCanon;
+      if (!ownedByCaller && !folioShared && !orgCanonReadable) continue;
+      filtered.push({
+        id: r.id as string,
+        content: r.content as string,
+        score: r.score as number,
+        created_at: r.created_at as number,
+        tenant_user_id: ownerUserId,
+        tenant_org_id: orgId,
+        folio_ids: folioIds,
+        org_canon: orgCanon,
+      });
+      if (filtered.length >= k) break;
+    }
+
+    // Enough tenant-visible survivors, OR the index returned fewer candidates
+    // than asked for (exhausted — widening further cannot surface more).
+    if (filtered.length >= k || rows.length < fetchK) {
+      return filtered;
+    }
+    fetchK *= 4;
+  }
 }
 
 /**

@@ -18,8 +18,12 @@
  *       to the default user (mis-attribution, not a 401).
  *
  * Also asserts at the HTTP layer that /api/context (the every-turn
- * prompt-injection path) is literal-substring — the production
- * "Light Cycle" concept-recall failure class.
+ * prompt-injection path) resolves concept paraphrases via the semantic
+ * recall() strategies — the regression gate for the production
+ * "Light Cycle" failure class the dive found (it was substring-only on
+ * the first ~3 query words until the 2026-07-02 fix routed it through
+ * recall()). Requires the local oMLX embedder, same as the other dive
+ * suites.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
@@ -140,7 +144,7 @@ describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)",
     );
   }, 60_000);
 
-  test("ENFORCED: /api/context is literal-substring (the Light Cycle failure class)", async () => {
+  test("ENFORCED: /api/context resolves a concept paraphrase via semantic recall (Light Cycle regression gate)", async () => {
     await fetch(`${ENFORCED_URL}/api/retain`, {
       method: "POST",
       headers: { ...auth, ...json, "X-Mimir-User-Id": "teacher_a" },
@@ -153,23 +157,34 @@ describe("Q5 — tenant gate at the HTTP boundary (isolated service instances)",
     });
 
     // Concept paraphrase — none of these words appear in the stored text.
-    const miss = await fetch(`${ENFORCED_URL}/api/context?q=${encodeURIComponent("competency based assessment")}`, {
+    // Pre-fix this MISSED (substring on the first ~3 query words only);
+    // post-fix it must hit through recall()'s semantic strategy.
+    const paraphrase = await fetch(`${ENFORCED_URL}/api/context?q=${encodeURIComponent("competency based assessment")}`, {
       headers: { ...auth, "X-Mimir-User-Id": "teacher_a" },
     });
-    const missText = await miss.text();
+    const paraphraseText = await paraphrase.text();
 
-    // Literal word from the stored text.
+    // Literal word from the stored text — must keep working.
     const hit = await fetch(`${ENFORCED_URL}/api/context?q=${encodeURIComponent("graduation framework")}`, {
       headers: { ...auth, "X-Mimir-User-Id": "teacher_a" },
     });
     const hitText = await hit.text();
 
+    // And tenant isolation must survive the reroute: another tenant asking
+    // the same paraphrase sees nothing of teacher_a's document.
+    const cross = await fetch(`${ENFORCED_URL}/api/context?q=${encodeURIComponent("competency based assessment")}`, {
+      headers: { ...auth, "X-Mimir-User-Id": "student_b" },
+    });
+    const crossText = await cross.text();
+
     console.error(
-      `[dive:Q5] /api/context: paraphrase→${missText.includes("Light Cycle") ? "FOUND" : "missed"}; ` +
-        `literal→${hitText.includes("Light Cycle") ? "found" : "MISSED"}`,
+      `[dive:Q5] /api/context: paraphrase→${paraphraseText.includes("Light Cycle") ? "found" : "MISSED"}; ` +
+        `literal→${hitText.includes("Light Cycle") ? "found" : "MISSED"}; ` +
+        `cross-tenant→${crossText.includes("Light Cycle") ? "LEAKED" : "isolated"}`,
     );
-    expect(hitText).toContain("Light Cycle");     // substring path works
-    expect(missText).not.toContain("Light Cycle"); // concept path structurally absent (service.ts:506)
+    expect(paraphraseText).toContain("Light Cycle"); // semantic path now wired (service.ts Phase 1 → recall())
+    expect(hitText).toContain("Light Cycle");        // literal path still works
+    expect(crossText).not.toContain("Light Cycle");  // tenant wall holds through recall()
   }, 60_000);
 
   // ── CUTOVER (today's production) posture ───────────────────

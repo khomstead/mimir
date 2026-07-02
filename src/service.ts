@@ -501,50 +501,37 @@ async function handleRequest(req: Request): Promise<Response> {
     const seenEpisodes = new Set<string>(); // Dedupe by episode content prefix
 
     // ── Phase 1: Find Thoughts matching query, hydrate to source Episodes ──
-    // Phase 1E: tenant-scoped Thought + Episode matches.
-    // as_of: filter Episodes by event_at so we only see content from before the cutoff.
+    // Routed through recall() (Q3 fix, 2026-07-02): the old path substring-
+    // matched the first ~3 query words only, so concept paraphrases missed
+    // (the production "Light Cycle" failure). recall() runs the semantic +
+    // graph + anchor strategies, tenant-scoped, with provenance hydration
+    // already applied — the same path the dive verified hits paraphrases at
+    // rank 0. `words` still feeds the entity/fact phases below.
     const words = query.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
     const thoughtSections: string[] = [];
-    for (const word of words.slice(0, 3)) {
-      const { fragment: tFrag, params: tParams } = applyTenantFilter("t", filter, "tt");
-      const { fragment: epFrag, params: epParams } = applyTenantFilter("ep", filter, "tep");
-      const asOfFilter = asOf !== undefined ? " AND t.created_at <= $asOf" : "";
-      const params: Record<string, unknown> = { q: word, ...tParams, ...epParams };
-      if (asOf !== undefined) params.asOf = asOf;
-      const r = await g.query(
-        `MATCH (t:Thought)
-         WHERE toLower(t.content) CONTAINS toLower($q)
-           AND ${tFrag}${asOfFilter}
-         OPTIONAL MATCH (t)-[:extracted_from]->(ep:Episode)
-         WHERE ${epFrag}
-         RETURN t.content AS thought, t.created_at AS ts,
-                ep.content AS episode, ep.source_type AS source
-         ORDER BY t.created_at DESC LIMIT 3`,
-        { params },
-      );
-      if (r.data) {
-        for (const row of r.data as Record<string, unknown>[]) {
-          const episode = row.episode as string | null;
-          const thought = row.thought as string;
-          const d = new Date(row.ts as number).toLocaleDateString();
-          const source = row.source as string || "conversation";
+    const recallRes = await recall(query, filter, undefined, undefined, asOf);
+    for (const r of recallRes.results) {
+      if (r.type !== "thought") continue; // anchors get their own section below
+      const d = new Date(r.created_at).toLocaleDateString();
 
-          // Prefer full episode; fall back to thought content
-          if (episode) {
-            const key = episode.slice(0, 80);
-            if (seenEpisodes.has(key)) continue;
-            seenEpisodes.add(key);
-            const content = episode.length > MAX_EPISODE_CHARS
-              ? episode.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
-              : episode;
-            thoughtSections.push(`- [${d}] [SOURCE: ${source}]\n${content}`);
-          } else {
-            const key = thought.slice(0, 80);
-            if (seenEpisodes.has(key)) continue;
-            seenEpisodes.add(key);
-            thoughtSections.push(`- [${d}] ${thought}`);
-          }
-        }
+      // Prefer full hydrated episode ("<source_type>: <content>"); fall back
+      // to thought content.
+      if (r.provenance) {
+        const sep = r.provenance.indexOf(": ");
+        const source = sep > 0 ? r.provenance.slice(0, sep) : "conversation";
+        const episode = sep > 0 ? r.provenance.slice(sep + 2) : r.provenance;
+        const key = episode.slice(0, 80);
+        if (seenEpisodes.has(key)) continue;
+        seenEpisodes.add(key);
+        const content = episode.length > MAX_EPISODE_CHARS
+          ? episode.slice(0, MAX_EPISODE_CHARS) + "… [truncated]"
+          : episode;
+        thoughtSections.push(`- [${d}] [SOURCE: ${source}]\n${content}`);
+      } else {
+        const key = r.content.slice(0, 80);
+        if (seenEpisodes.has(key)) continue;
+        seenEpisodes.add(key);
+        thoughtSections.push(`- [${d}] ${r.content}`);
       }
     }
 

@@ -278,16 +278,16 @@ describe("Q2 — recall correctness at classroom scale (isolated instance)", () 
       console.error(`[dive:P2] crowd=${cumulative} → teacher recall@10 = ${found}/10`);
     }
 
-    // Baseline (no crowd) must be perfect …
-    expect(curve[0].recallAt10).toBe(10);
-    // … and this test DOCUMENTS the degradation curve. The final point is
-    // past the hard over-fetch ceiling (k=10 → window 256; max 1000): if
-    // recall@10 is still 10/10 at crowd=1200 the "box" concern is REFUTED;
-    // if it collapses, it is CONFIRMED with the exact cliff location.
-    const final = curve[curve.length - 1];
+    // REGRESSION GATE (2026-07-02, crowding-cliff fix): vectorSearch now
+    // escalates its candidate window until k tenant-visible survivors are
+    // found, so the caller's own top-k must be perfect at EVERY crowd level
+    // — including past the former hard ceiling (k=10 → window 256; max
+    // 1000). The dive originally observed 10/10 → 0/10 at crowd=300.
     console.error(`[dive:P2] DEGRADATION CURVE: ${JSON.stringify(curve)}`);
-    // No hard assert on the final value — the curve itself is the evidence.
-    expect(final.crowd).toBe(1200);
+    for (const point of curve) {
+      expect(point.recallAt10).toBe(10);
+    }
+    expect(curve[curve.length - 1].crowd).toBe(1200);
   }, 120_000);
 
   test("Part 3 — positive isolation: 6 sampled tenants see only their own content", async () => {

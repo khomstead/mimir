@@ -1,0 +1,69 @@
+{
+  "data_path": "/tmp/zztest-tiebreaker-2026-07-06-91123",
+  "seed_note": "mulberry32 seeds: rows=42, probes=1234; ids structured tb-cXX-mYYY-pN",
+  "omlx_reachable": true,
+  "phaseA_sweep_latency": {
+    "500": {
+      "p50": 1.538957999999866,
+      "p95": 1.9912499999999227
+    },
+    "1000": {
+      "p50": 1.6508340000000317,
+      "p95": 2.0722500000001673
+    },
+    "1530": {
+      "p50": 1.9155839999998534,
+      "p95": 2.466625000000022
+    }
+  },
+  "phaseB_window_occupancy": {
+    "caller_in_256": 0,
+    "caller_in_1000": 0,
+    "decoys": 1100
+  },
+  "phaseB_latency": {
+    "crowded_escalated": {
+      "p50": 18.313624999999774,
+      "p95": 20.54220899999973
+    },
+    "uncrowded_first_window": {
+      "p50": 1.8172080000003916,
+      "p95": 2.07037500000024
+    }
+  },
+  "phaseC_contention": {
+    "worker": {
+      "processed": 880,
+      "failed": 0,
+      "skipped": 0,
+      "passes": 100,
+      "rearms": 12,
+      "workerErrors": 0,
+      "retain_analog_thoughts": 10
+    },
+    "latency_ms": {
+      "quiet_pre": {
+        "p50": 1.9007500000002437,
+        "p95": 2.03970900000013
+      },
+      "contended_worker": {
+        "p50": 2.042750000000524,
+        "p95": 2.262333000000126
+      },
+      "contended_worker_plus_retain": {
+        "p50": 1.924166000000696,
+        "p95": 2.6465420000004087
+      },
+      "quiet_post": {
+        "p50": 1.8714579999996204,
+        "p95": 2.201791999999841
+      },
+      "recall_verb_contended": {
+        "p50": 12.131624999999985,
+        "p95": 487.6212919999998
+      }
+    },
+    "wrong_neighbor_probes": 0,
+    "recall_errors": 0
+  }
+}

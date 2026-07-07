@@ -23,6 +23,7 @@ import { processQueue } from "./verbs/process-queue.js";
 import { forget, forgetByShareRevocation } from "./verbs/forget.js";
 import { explainEpisode } from "./verbs/explain-episode.js";
 import { generateEmbedding } from "./embeddings.js";
+import { evaluateServiceGate } from "./ingestion-classification.js";
 import type { TenantStamp, TenantFilter } from "./types.js";
 
 const DATA_PATH =
@@ -272,6 +273,31 @@ async function handleRequest(req: Request): Promise<Response> {
     if (!body.content) return errorResponse("Missing content field");
     const stampResult = extractTenantStamp(req);
     if ("denied" in stampResult) return stampResult.denied;
+
+    // ── Sprint G1: consent/classification gate — SERVICE ENFORCEMENT ──
+    // The trust boundary. Re-classify server-side (independent of the daemon's
+    // classification) so a direct HTTP caller who skips the daemon cannot slip
+    // minor data past the gate. Runs AFTER extractTenantStamp (so blocked
+    // attempts are still tenant-attributed in the log) and BEFORE retain() (so
+    // blocked content NEVER reaches the graph). Fail-closed: strong minor-PII
+    // markers → 403, no retain. "The daemon classifies, the service enforces."
+    const gate = evaluateServiceGate(body.content, body.source);
+    if (gate.blocked) {
+      console.error(
+        `[mimir:gate] BLOCKED direct retain (tenant=${stampResult.stamp.userId}) — ${gate.reason}`,
+      );
+      return jsonResponse(
+        {
+          blocked: true,
+          stored: false,
+          recordClass: gate.recordClass,
+          reason: gate.reason,
+          classificationVersion: gate.version,
+        },
+        403,
+      );
+    }
+
     // event_at: accept ISO 8601 string or Unix ms integer
     let eventAt: number | undefined;
     if (body.event_at !== undefined) {

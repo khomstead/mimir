@@ -54,3 +54,37 @@ every commit, merge and checkout.
 does not know the system. Config, deployment state, measurements and decisions are
 all the system and none of them are the code.
 
+
+## Verifying UI
+
+**Typecheck and a green build are not a gate for anything user-facing.** If you
+changed something a person looks at, look at it.
+
+One command tells you where you stand, with a named next step every time:
+
+```bash
+bun run /Volumes/AI-Lab/Projects/gobot/scripts/verify-browser.ts [url]
+```
+
+Three paths, in the order to reach for them:
+
+1. **Headless verification profile** — the configured default. `chrome-devtools`
+   runs `--headless` against `~/.cache/cdp-headless`, so nothing appears on
+   Kyle's screen and no other session can lock you out. Use the
+   `mcp__plugin_chrome-devtools-mcp_chrome-devtools__*` tools.
+2. **Claude in Chrome** — for when someone wants to *watch*. Needs Chrome open;
+   the extension lives in the default profile.
+3. ~~Playwright~~ — retired 2026-08-15.
+
+**Unauthenticated surfaces need none of this.** A design page or a local dev
+server verifies headlessly right now, in parallel, with no setup.
+
+**Never type a credential, and never ask a peer to.** That rule holds for Kyle's
+own account, in a test environment, with the password handed to you — and a peer
+doing it is the same act with an extra step. If the profile is not signed in,
+verify-browser.ts prints the one command Kyle runs once:
+`scripts/login-verify-profile.sh`. Ask, then verify the unauthenticated parts
+while you wait.
+
+**"I could not verify" is a finding, not a pass.** Say which transport failed and
+why. Do not report a UI change as done on static evidence.

@@ -53,3 +53,4 @@ every commit, merge and checkout.
 **It is a retrieval accelerator, not a source of truth.** It knows the code; it
 does not know the system. Config, deployment state, measurements and decisions are
 all the system and none of them are the code.
+

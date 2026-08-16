@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Keep the code graph in step with the code, at the moment the code changes.
+#
+# WHY A HOOK AND NOT A CRON. A timer refreshes on a schedule that has nothing to
+# do with when the repo actually moved — it is late after every commit and wasted
+# in between. The commit IS the event. Firing here means the graph is stale for
+# seconds rather than up to half an hour, and costs nothing when nothing changed.
+#
+# NEVER BLOCKS A COMMIT. Indexing takes 12s-3min. This detaches immediately and
+# always exits 0, so a broken or slow indexer can never stop you committing. The
+# session map reports staleness anyway, which is the visible backstop if this
+# silently stops working.
+#
+# Shared across worktrees: git resolves hooks from the primary .git for every
+# linked worktree, so installing once covers them all.
+REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -x "/Volumes/AI-Lab/Projects/gobot/scripts/gitnexus-refresh.sh" ] || exit 0
+nohup "/Volumes/AI-Lab/Projects/gobot/scripts/gitnexus-refresh.sh" \
+  >> /Volumes/AI-Lab/logs/gitnexus-refresh.log 2>&1 &
+disown 2>/dev/null || true
+exit 0

@@ -60,7 +60,19 @@ export async function initGraph(dataPath: string): Promise<Graph> {
     );
   }
 
-  db = await FalkorDB.open({ path: dataPath });
+  // falkordblite defaults to a 10s readiness timeout, which is shorter than a
+  // cold load of this graph: measured 12.2s to first PONG against the live
+  // 66 MB dump.rdb on 2026-08-21, and slower still with an empty page cache
+  // right after a reboot. When it expires, initGraph throws, launchd's
+  // KeepAlive restarts the service, and the next attempt starts the load over
+  // from scratch — a loop that cannot converge, which is how Mimir stayed down
+  // for the two hours after the 2026-08-21 kernel panic. The timeout only
+  // bounds how long we WAIT for redis-server; it costs nothing when the load
+  // is fast, so it is set well above any observed load rather than just above.
+  db = await FalkorDB.open({
+    path: dataPath,
+    timeout: Number(process.env.MIMIR_DB_STARTUP_TIMEOUT_MS ?? 120_000),
+  });
   graph = db.selectGraph("mimir");
 
   // Create indexes idempotently

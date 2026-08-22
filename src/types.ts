@@ -410,7 +410,21 @@ export interface RecallResult {
 export interface RecallResponse {
   results: RecallResult[];
   query: string;
+  /**
+   * Strategies that RETURNED something. A strategy missing from this list may
+   * have run and found nothing, or may not have run at all — which is exactly
+   * the ambiguity `complete` resolves.
+   */
   strategies_used: string[];
+  /**
+   * DEV-839. False when at least one retrieval strategy could not run, so an
+   * empty `results` proves nothing about what Mimir holds. Callers that answer
+   * a person should say they are answering on less; before this, a degraded
+   * Mimir and an empty Mimir were the same HTTP 200 with an empty list, and
+   * on 2026-08-21 the chat answered normally with no memory at all.
+   */
+  complete?: boolean;
+  degraded?: Array<{ strategy: string; reason: string; detail?: string }>;
 }
 
 export interface ExtractionResult {

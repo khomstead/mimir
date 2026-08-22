@@ -90,9 +90,12 @@ function originBoost(origin: RecallOrigin): number {
  * Strategy 1: Semantic vector search — tenant-scoped (Phase 1E).
  * Generate an embedding for the query and find similar Thoughts.
  */
+export type DegradedNote = { strategy: string; reason: string; detail?: string };
+
 async function semanticSearch(
   query: string,
   filter: TenantFilter,
+  degraded: DegradedNote[],
 ): Promise<IntermediateResult[]> {
   // FAIL LOUD: embedder errors used to be swallowed by a bare catch → semantic
   // search silently returned nothing for weeks. A dead embedder is now logged,
@@ -104,6 +107,16 @@ async function semanticSearch(
     console.error(
       `[mimir:recall] semantic search DISABLED — embedder error: ${(err as Error).message}`,
     );
+    // DEV-839. Logging it loudly server-side is not the same as telling the
+    // CALLER. Returning [] here made "I searched and found nothing" and "I
+    // could not search at all" the same HTTP 200 with an empty list, and those
+    // two facts should produce very different behaviour upstream — the chat
+    // says "answering without memory" for one and nothing for the other.
+    degraded.push({
+      strategy: "semantic",
+      reason: "embedder unavailable",
+      detail: (err as Error).message.slice(0, 160),
+    });
     return [];
   }
 
@@ -116,6 +129,11 @@ async function semanticSearch(
     console.error(
       `[mimir:recall] vectorSearch failed: ${(err as Error).message}`,
     );
+    degraded.push({
+      strategy: "semantic",
+      reason: "vector search failed",
+      detail: (err as Error).message.slice(0, 160),
+    });
     return [];
   }
 
@@ -421,6 +439,11 @@ export async function recall(
       "recall: TenantFilter with callerUserId is required (Phase 1E).",
     );
   }
+  // DEV-839 — collects any retrieval strategy that could not RUN, as opposed
+  // to one that ran and found nothing. Passed down rather than module-scoped so
+  // concurrent recalls cannot contaminate each other's answer.
+  const degraded: DegradedNote[] = [];
+
   // Intent='when': run temporal Episode search alongside standard strategies.
   // Other intents use standard strategies but with score adjustments below.
   const useTemporalStrategy = intent === "when";
@@ -428,7 +451,7 @@ export async function recall(
   // Run strategies in parallel based on intent — all four scoped by tenant.
   const [semanticResults, graphResults, anchorResults, temporalResults] =
     await Promise.all([
-      semanticSearch(query, filter),
+      semanticSearch(query, filter, degraded),
       graphSearch(query, filter, timeRange, asOf),
       anchorSearch(query, filter, timeRange, asOf),
       useTemporalStrategy ? temporalSearch(query, filter, asOf) : Promise.resolve([] as IntermediateResult[]),
@@ -516,6 +539,11 @@ export async function recall(
     results,
     query,
     strategies_used: strategiesUsed,
+    // DEV-839 — the difference between "nothing is known" and "I could not
+    // look". `complete: false` means at least one retrieval strategy could not
+    // run, so an empty result set proves nothing about what Mimir holds.
+    complete: degraded.length === 0,
+    ...(degraded.length > 0 && { degraded }),
     ...(asOf !== undefined && { as_of: asOf }),
     ...(intent !== undefined && { intent }),
   };

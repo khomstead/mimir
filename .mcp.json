@@ -1,0 +1,26 @@
+{
+  "_comment": "THIS REPO IS PUBLIC. The `mimir` MCP server is deliberately ABSENT here: its config in gobot/.mcp.json carries MIMIR_SHARED_SECRET and MIMIR_USER_ID inline, and committing those to a public repo would publish them. A session working ON mimir has the service on localhost:4200 anyway and does not need the proxy. Do not copy gobot/.mcp.json here wholesale. (DEV-825 follow-up, 2026-08-22.)",
+  "mcpServers": {
+    "google-workspace": {
+      "command": "bun",
+      "args": [
+        "run",
+        "/Volumes/AI-Lab/Projects/gobot/src/mcp/google-workspace-server.ts"
+      ]
+    },
+    "mosscap": {
+      "command": "bun",
+      "args": [
+        "run",
+        "/Volumes/AI-Lab/Projects/gobot/scripts/mcp-mosscap-local.ts"
+      ]
+    },
+    "firecrawl": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "firecrawl-mcp"
+      ]
+    }
+  }
+}
